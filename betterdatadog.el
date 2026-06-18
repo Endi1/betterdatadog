@@ -940,15 +940,23 @@ available, so only graph data is re-fetched."
     (message "betterdatadog: graph window set to %s"
              (betterdatadog--format-duration secs))))
 
-(defvar betterdatadog-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "g") #'betterdatadog-refresh)
-    (define-key map (kbd "t") #'betterdatadog-toggle-graphs)
-    (define-key map (kbd "s") #'betterdatadog-toggle-queries)
-    (define-key map (kbd "w") #'betterdatadog-set-window)
-    (define-key map (kbd "q") #'quit-window)
-    map)
-  "Keymap for `betterdatadog-mode'.")
+(defvar betterdatadog-mode-map (make-sparse-keymap)
+  "Keymap for `betterdatadog-mode'.
+
+Intentionally empty: betterdatadog ships no key bindings of its own so it
+does not clobber your setup.  Bind the interactive commands yourself, for
+example:
+
+  (with-eval-after-load \\='betterdatadog
+    (define-key betterdatadog-mode-map (kbd \"g\") #\\='betterdatadog-refresh)
+    (define-key betterdatadog-mode-map (kbd \"t\") #\\='betterdatadog-toggle-graphs)
+    (define-key betterdatadog-mode-map (kbd \"s\") #\\='betterdatadog-toggle-queries)
+    (define-key betterdatadog-mode-map (kbd \"w\") #\\='betterdatadog-set-window))
+
+The commands are `betterdatadog-refresh', `betterdatadog-toggle-graphs',
+`betterdatadog-toggle-queries', and `betterdatadog-set-window'.  Standard
+`special-mode' keys (e.g. \\`q' to quit, \\`g' to revert) remain available
+from the parent map unless you rebind them.")
 
 (define-derived-mode betterdatadog-mode special-mode "Datadog"
   "Major mode for viewing a Datadog dashboard.
@@ -957,20 +965,6 @@ available, so only graph data is re-fetched."
   (setq-local revert-buffer-function
               (lambda (&rest _) (betterdatadog-refresh)))
   (setq truncate-lines nil))
-
-;; Evil integration.  Evil's state keymaps shadow a major mode's own
-;; single-key bindings, so `g'/`t'/`s'/`w'/`q' would run Evil commands
-;; instead of ours.  Put the buffer in motion state (read-only and
-;; navigation-friendly) and mark our map as overriding so its bindings
-;; win.  Declared functions/variables avoid load-order warnings; the body
-;; only runs once Evil is actually loaded.
-(declare-function evil-set-initial-state "evil-core")
-(declare-function evil-make-overriding-map "evil-core")
-(declare-function evil-normalize-keymaps "evil-core")
-(with-eval-after-load 'evil
-  (evil-set-initial-state 'betterdatadog-mode 'motion)
-  (evil-make-overriding-map betterdatadog-mode-map 'motion)
-  (add-hook 'betterdatadog-mode-hook #'evil-normalize-keymaps))
 
 ;;;###autoload
 (defun betterdatadog-show-dashboard (dashboard-id)
