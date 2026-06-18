@@ -17,6 +17,12 @@ A better Datadog client for Emacs.
   querying. Toggle with `betterdatadog-toggle-graphs`; set the size with
   `betterdatadog-graph-height` and `betterdatadog-sparkline-width`.
 
+- **Remembered dashboard ids** — every id that fetches successfully is saved
+  (with its title) to `betterdatadog-history-file`, so next time
+  `betterdatadog-show-dashboard` offers it for completion — `TAB` to pick a
+  remembered dashboard instead of pasting the id again. Set the variable to
+  `nil` to disable persistence.
+
 More to come (monitors, metric explorer).
 
 ## Install
@@ -56,6 +62,10 @@ M-x betterdatadog-show-dashboard RET <dashboard-id> RET
 
 The dashboard id is the slug in the dashboard URL, e.g. the `abc-def-ghi` in
 `https://app.datadoghq.com/dashboard/abc-def-ghi/`.
+
+Once an id has been fetched successfully it is remembered, so on later calls
+you can hit `TAB` at the prompt and pick it (each candidate is annotated with
+the dashboard title) instead of pasting the id again.
 
 The dashboard buffer derives from `special-mode`, so the usual read-only
 keys apply (`q` quits, `g` reverts/refreshes, `SPC`/`DEL` scroll).

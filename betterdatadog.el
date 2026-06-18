@@ -114,6 +114,17 @@ demand, as the dashboard renders."
   :type 'number
   :group 'betterdatadog)
 
+(defcustom betterdatadog-history-file
+  (locate-user-emacs-file "betterdatadog-history.el")
+  "File where successfully fetched dashboard ids are remembered.
+Each id that is fetched without error is stored here, together with the
+dashboard title, so `betterdatadog-show-dashboard' can offer it for
+completion next time instead of requiring you to paste the id again.
+Set to nil to disable persistence (ids are then remembered only for the
+current Emacs session)."
+  :type '(choice (const :tag "Do not persist" nil) file)
+  :group 'betterdatadog)
+
 ;;;; Faces
 
 (defface betterdatadog-title-face
@@ -878,6 +889,79 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
           (insert "\n"))))
     (goto-char (point-min))))
 
+;;;; Dashboard id history
+
+(defvar betterdatadog--dashboard-history nil
+  "Alist of remembered dashboards, mapping id (string) to title (string).
+Most recently fetched first.  Populated from `betterdatadog-history-file'
+on first use and updated whenever a dashboard is fetched successfully.")
+
+(defvar betterdatadog--history-loaded nil
+  "Non-nil once `betterdatadog-history-file' has been read this session.")
+
+(defvar betterdatadog--id-prompt-history nil
+  "Minibuffer history of dashboard ids entered this session.")
+
+(defun betterdatadog--load-history ()
+  "Load remembered dashboard ids from `betterdatadog-history-file'.
+Reads the file at most once per session; a missing or unreadable file is
+treated as an empty history.  Returns `betterdatadog--dashboard-history'."
+  (unless betterdatadog--history-loaded
+    (setq betterdatadog--history-loaded t)
+    (when (and betterdatadog-history-file
+               (file-readable-p betterdatadog-history-file))
+      (with-demoted-errors "betterdatadog: could not read history: %S"
+        (with-temp-buffer
+          (insert-file-contents betterdatadog-history-file)
+          (let ((data (read (current-buffer))))
+            (when (listp data)
+              (setq betterdatadog--dashboard-history data)))))))
+  betterdatadog--dashboard-history)
+
+(defun betterdatadog--save-history ()
+  "Write `betterdatadog--dashboard-history' to `betterdatadog-history-file'."
+  (when betterdatadog-history-file
+    (with-demoted-errors "betterdatadog: could not save history: %S"
+      (let ((dir (file-name-directory betterdatadog-history-file)))
+        (when (and dir (not (file-directory-p dir)))
+          (make-directory dir t)))
+      (with-temp-file betterdatadog-history-file
+        (insert ";; betterdatadog dashboard id history -*- lexical-binding: t; -*-\n")
+        (insert ";; Auto-generated; edit at your own risk.\n")
+        (prin1 betterdatadog--dashboard-history (current-buffer))
+        (insert "\n")))))
+
+(defun betterdatadog--remember-dashboard (id title)
+  "Record that dashboard ID (with TITLE) was fetched successfully.
+Moves ID to the front of the history and persists it."
+  (betterdatadog--load-history)
+  (setq betterdatadog--dashboard-history
+        (cons (cons id (or title ""))
+              (assoc-delete-all id betterdatadog--dashboard-history)))
+  (betterdatadog--save-history))
+
+(defun betterdatadog--read-dashboard-id ()
+  "Prompt for a dashboard id, offering remembered ids for completion.
+Each candidate is annotated with the dashboard title.  Free input is
+allowed, so a brand-new id can still be pasted in."
+  (betterdatadog--load-history)
+  (let* ((history betterdatadog--dashboard-history)
+         (annotation (lambda (id)
+                       (let ((title (cdr (assoc id history))))
+                         (if (and title (not (string-empty-p title)))
+                             (concat "  " title)
+                           ""))))
+         (completion-extra-properties
+          (list :annotation-function annotation)))
+    (string-trim
+     (completing-read
+      (if history
+          "Datadog dashboard id (TAB to complete remembered ids): "
+        "Datadog dashboard id: ")
+      (mapcar #'car history)
+      nil nil nil
+      'betterdatadog--id-prompt-history))))
+
 ;;;; Mode and entry points
 
 (defvar betterdatadog--current-dashboard-id nil
@@ -972,8 +1056,11 @@ from the parent map unless you rebind them.")
 
 Prompts for the dashboard id interactively.  The id is the string
 that appears in the dashboard URL, e.g. the \"abc-def-ghi\" in
-https://app.datadoghq.com/dashboard/abc-def-ghi/."
-  (interactive "sDatadog dashboard id: ")
+https://app.datadoghq.com/dashboard/abc-def-ghi/.
+
+Ids that fetch successfully are remembered in `betterdatadog-history-file'
+and offered for completion on subsequent calls."
+  (interactive (list (betterdatadog--read-dashboard-id)))
   (setq dashboard-id (string-trim dashboard-id))
   (when (string-empty-p dashboard-id)
     (user-error "A dashboard id is required"))
@@ -982,6 +1069,8 @@ https://app.datadoghq.com/dashboard/abc-def-ghi/."
          (dashboard (betterdatadog--get
                      (concat "/api/v1/dashboard/" (url-hexify-string dashboard-id))))
          (buffer (get-buffer-create betterdatadog-buffer-name)))
+    ;; The fetch succeeded, so remember the id for next time.
+    (betterdatadog--remember-dashboard dashboard-id (alist-get 'title dashboard))
     (with-current-buffer buffer
       (unless (derived-mode-p 'betterdatadog-mode)
         (betterdatadog-mode))
