@@ -265,6 +265,12 @@ substituted before any that are a prefix of them."
                   (format "%s:%s" prefix val)
                 val)))
         (when (and (stringp name) (not (string-empty-p name)))
+          ;; Datadog dashboard JSON may use either "$var" (which expands to
+          ;; the dashboard's prefixed form, e.g. "service:api") or
+          ;; "$var.value" inside an already-prefixed query like
+          ;; "service:$service.value".  Handle both before the generic
+          ;; unresolved-variable fallback eats the dotted reference.
+          (push (cons (concat name ".value") val) map)
           (push (cons name replacement) map))))
     (sort map (lambda (a b) (> (length (car a)) (length (car b)))))))
 
@@ -314,23 +320,227 @@ signal a `user-error' when S cannot be parsed."
     (format "/api/v1/query?from=%d&to=%d&query=%s"
             from to (url-hexify-string query))))
 
+(defun betterdatadog--post-json (path data)
+  "POST DATA as JSON to PATH and return the parsed JSON response."
+  (let* ((url (concat "https://" (betterdatadog--api-host) path))
+         (url-request-method "POST")
+         (url-request-extra-headers
+          `(("DD-API-KEY" . ,(betterdatadog--api-key))
+            ("DD-APPLICATION-KEY" . ,(betterdatadog--app-key))
+            ("Accept" . "application/json")
+            ("Content-Type" . "application/json")))
+         (url-request-data (json-encode data))
+         (buffer (url-retrieve-synchronously url t t 30)))
+    (unless buffer
+      (user-error "betterdatadog: request to %s failed (no response)" url))
+    (unwind-protect
+        (with-current-buffer buffer
+          (goto-char (point-min))
+          (let ((status (if (re-search-forward "^HTTP/[0-9.]+ \\([0-9]+\\)" nil t)
+                            (string-to-number (match-string 1))
+                          0)))
+            (goto-char (point-min))
+            (unless (re-search-forward "\n\n\\|\r\n\r\n" nil t)
+              (user-error "betterdatadog: malformed HTTP response from %s" url))
+            (let* ((body (decode-coding-string
+                          (buffer-substring-no-properties (point) (point-max))
+                          'utf-8))
+                   (json-object-type 'alist)
+                   (json-array-type 'list)
+                   (json-key-type 'symbol)
+                   (parsed (when (> (length (string-trim body)) 0)
+                             (ignore-errors (json-read-from-string body)))))
+              (unless (and (>= status 200) (< status 300))
+                (user-error "betterdatadog: HTTP %s from %s%s"
+                            status url
+                            (let ((errs (and (listp parsed) (alist-get 'errors parsed))))
+                              (if errs (format " — %s"
+                                               (string-join
+                                                (mapcar #'format-message
+                                                        (if (listp errs) errs (list errs)))
+                                                "; "))
+                                ""))))
+              parsed)))
+      (kill-buffer buffer))))
+
+(defun betterdatadog--query-spec (query)
+  "Return an internal query spec from a dashboard QUERY alist."
+  (let ((q (or (alist-get 'query query)
+               (alist-get 'q query)
+               (alist-get 'query (alist-get 'search query))))
+        (ds (alist-get 'data_source query)))
+    (when (and q (stringp q))
+      (if (and ds (not (member ds '("metrics" "metric"))))
+          (list :data-source ds
+                :query q
+                :compute (alist-get 'compute query)
+                :group-by (alist-get 'group_by query))
+        q))))
+
+(defun betterdatadog--spec-query (spec)
+  "Return the human-readable query string in SPEC."
+  (if (stringp spec) spec (plist-get spec :query)))
+
+(defun betterdatadog--resolve-spec (spec)
+  "Resolve template variables in SPEC."
+  (if (stringp spec)
+      (betterdatadog--resolve-query spec)
+    (let ((copy (copy-sequence spec)))
+      (plist-put copy :query (betterdatadog--resolve-query (plist-get copy :query)))
+      copy)))
+
+(defun betterdatadog--query-cache-key (spec)
+  "Return the cache key for resolved SPEC."
+  (if (stringp spec) spec (prin1-to-string spec)))
+
 (defun betterdatadog--fetch-series (query)
   "Synchronously fetch the series for resolved QUERY (no cache)."
   (alist-get 'series (betterdatadog--get (betterdatadog--query-path query))))
 
-(defun betterdatadog--query-series (query)
-  "Return the series for resolved QUERY (each with a `pointlist'), or nil.
+(defun betterdatadog--analytics-interval ()
+  "Return a Datadog analytics interval string for the current graph window."
+  (format "%ds" (max 60 (truncate (/ betterdatadog-graph-window-seconds 60)))))
+
+(defun betterdatadog--analytics-compute (compute &optional scalar)
+  "Return a logs/spans analytics compute object from dashboard COMPUTE.
+When SCALAR is non-nil, omit timeseries-only fields so Datadog returns a
+single aggregate value."
+  (let ((aggregation (or (alist-get 'aggregation compute) "count"))
+        (metric (alist-get 'metric compute)))
+    (append `((aggregation . ,aggregation))
+            (unless scalar
+              `((interval . ,(betterdatadog--analytics-interval))
+                (type . "timeseries")))
+            (when metric `((metric . ,metric))))))
+
+(defun betterdatadog--parse-iso-ms (s)
+  "Parse ISO timestamp S and return milliseconds since the epoch."
+  (* 1000.0 (float-time (date-to-time s))))
+
+(defun betterdatadog--json-array (list)
+  "Return LIST as a JSON array value."
+  (and list (vconcat list)))
+
+(defun betterdatadog--analytics-group-by (group-by)
+  "Return GROUP-BY adjusted for the analytics aggregate API."
+  (betterdatadog--json-array
+   (mapcar (lambda (g)
+             ;; Dashboard sort objects can use UI-only fields that the public
+             ;; analytics aggregate API rejects for timeseries queries.  The
+             ;; API still returns the limited buckets without an explicit sort.
+             (assq-delete-all 'sort (copy-sequence g)))
+           group-by)))
+
+(defun betterdatadog--analytics-request (spec &optional scalar window-seconds)
+  "Return (PATH . BODY) for resolved logs/spans analytics SPEC.
+When SCALAR is non-nil, request a single aggregate over WINDOW-SECONDS."
+  (let* ((ds (plist-get spec :data-source))
+         (path (pcase ds
+                 ("logs" "/api/v2/logs/analytics/aggregate")
+                 ("spans" "/api/v2/spans/analytics/aggregate")
+                 (_ (user-error "unsupported data_source %s" ds))))
+         (attrs `((filter . ((query . ,(plist-get spec :query))
+                             (from . ,(format "now-%ds"
+                                             (or window-seconds
+                                                 betterdatadog-graph-window-seconds)))
+                             (to . "now")))
+                  (compute . ,(vector (betterdatadog--analytics-compute
+                                        (plist-get spec :compute) scalar)))))
+         (group-by (betterdatadog--analytics-group-by (plist-get spec :group-by)))
+         (body (if (equal ds "spans")
+                   `((data . ((type . "aggregate_request")
+                              (attributes . ,(append attrs (when group-by `((group_by . ,group-by))))))))
+                 (append attrs (when group-by `((group_by . ,group-by)))))))
+    (cons path body)))
+
+(defun betterdatadog--analytics-scalar-from-response (parsed)
+  "Extract the first scalar compute value from an analytics response PARSED."
+  (let* ((data (alist-get 'data parsed))
+         (buckets (alist-get 'buckets (if (and (listp data) (alist-get 'attributes data))
+                                          (alist-get 'attributes data)
+                                        data)))
+         (computes (alist-get 'computes (car buckets)))
+         (c0 (alist-get 'c0 computes)))
+    (cond
+     ((numberp c0) c0)
+     ((and (listp c0) (listp (car c0)))
+      (betterdatadog--last-number (mapcar (lambda (p) (alist-get 'value p)) c0)))
+     (t nil))))
+
+(defun betterdatadog--analytics-series-from-response (parsed)
+  "Extract betterdatadog series from an analytics aggregate response PARSED."
+  (let* ((data (alist-get 'data parsed))
+         (buckets (alist-get 'buckets (if (and (listp data) (alist-get 'attributes data))
+                                          (alist-get 'attributes data)
+                                        data))))
+    (delq nil
+          (mapcar
+           (lambda (bucket)
+             (let* ((computes (alist-get 'computes bucket))
+                    (c0 (alist-get 'c0 computes))
+                    (points (cond
+                             ((and (listp c0) (listp (car c0)))
+                              (mapcar (lambda (p)
+                                        (list (betterdatadog--parse-iso-ms
+                                               (alist-get 'time p))
+                                              (alist-get 'value p)))
+                                      c0))
+                             ((numberp c0)
+                              (list (list (* 1000.0 (float-time)) c0)))
+                             (t nil))))
+               (when points `((pointlist . ,points)))))
+           buckets))))
+
+(defun betterdatadog--fetch-analytics-series (spec)
+  "Fetch logs/spans analytics time series for resolved SPEC."
+  (let* ((req (betterdatadog--analytics-request spec))
+         (parsed (betterdatadog--post-json (car req) (cdr req))))
+    (betterdatadog--analytics-series-from-response parsed)))
+
+(defun betterdatadog--fetch-series-for-spec (spec)
+  "Synchronously fetch series for resolved SPEC (no cache)."
+  (if (stringp spec)
+      (betterdatadog--fetch-series spec)
+    (betterdatadog--fetch-analytics-series spec)))
+
+(defun betterdatadog--fetch-scalar-for-spec (spec window-seconds)
+  "Synchronously fetch a scalar value for resolved SPEC over WINDOW-SECONDS."
+  (if (stringp spec)
+      (betterdatadog--series-last-number (betterdatadog--fetch-series spec))
+    (let* ((req (betterdatadog--analytics-request spec t window-seconds))
+           (parsed (betterdatadog--post-json (car req) (cdr req))))
+      (betterdatadog--analytics-scalar-from-response parsed))))
+
+(defun betterdatadog--query-scalar (spec window-seconds)
+  "Return scalar value for SPEC over WINDOW-SECONDS, using the cache."
+  (let* ((resolved (betterdatadog--resolve-spec spec))
+         (key (format "scalar:%s:%s"
+                      window-seconds (betterdatadog--query-cache-key resolved))))
+    (if betterdatadog--series-cache
+        (let ((v (gethash key betterdatadog--series-cache 'miss)))
+          (if (eq v 'miss)
+              (let ((value (betterdatadog--fetch-scalar-for-spec
+                            resolved window-seconds)))
+                (puthash key value betterdatadog--series-cache)
+                value)
+            v))
+      (betterdatadog--fetch-scalar-for-spec resolved window-seconds))))
+
+(defun betterdatadog--query-series (spec)
+  "Return the series for resolved SPEC (each with a `pointlist'), or nil.
 Reads from `betterdatadog--series-cache' when active, falling back to a
 synchronous fetch on a cache miss (e.g. a request that timed out during
 prefetch).  A present-but-empty result is cached and honoured."
-  (if betterdatadog--series-cache
-      (let ((v (gethash query betterdatadog--series-cache 'miss)))
-        (if (eq v 'miss)
-            (let ((series (betterdatadog--fetch-series query)))
-              (puthash query series betterdatadog--series-cache)
-              series)
-          v))
-    (betterdatadog--fetch-series query)))
+  (let* ((resolved (betterdatadog--resolve-spec spec))
+         (key (betterdatadog--query-cache-key resolved)))
+    (if betterdatadog--series-cache
+        (let ((v (gethash key betterdatadog--series-cache 'miss)))
+          (if (eq v 'miss)
+              (let ((series (betterdatadog--fetch-series-for-spec resolved)))
+                (puthash key series betterdatadog--series-cache)
+                series)
+            v))
+      (betterdatadog--fetch-series-for-spec resolved))))
 
 (defun betterdatadog--collect-queries (widgets)
   "Return the de-duplicated list of resolved metric queries used by WIDGETS.
@@ -338,23 +548,24 @@ Recurses into group widgets and skips notes.  Drives parallel prefetch."
   (let ((seen (make-hash-table :test 'equal))
         (out '()))
     (cl-labels
-        ((add (q)
-           (when (and q (stringp q))
-             (let ((r (betterdatadog--resolve-query q)))
-               (unless (gethash r seen)
-                 (puthash r t seen)
+        ((add (spec)
+           (when spec
+             (let* ((r (betterdatadog--resolve-spec spec))
+                    (key (betterdatadog--query-cache-key r)))
+               (unless (gethash key seen)
+                 (puthash key t seen)
                  (push r out)))))
          (collect-req (req)
            (add (alist-get 'q req))
            (dolist (query (alist-get 'queries req))
-             (add (or (alist-get 'query query) (alist-get 'q query)))))
+             (add (betterdatadog--query-spec query))))
          (walk (ws)
            (dolist (w ws)
              (let* ((def (alist-get 'definition w))
                     (type (alist-get 'type def)))
                (cond
                 ((equal type "group") (walk (alist-get 'widgets def)))
-                ((equal type "note") nil)
+                ((member type '("note" "query_value")) nil)
                 (t (let ((reqs (alist-get 'requests def)))
                      (when (listp reqs)
                        (dolist (req reqs) (collect-req req))))))))))
@@ -370,7 +581,8 @@ missing afterward are fetched synchronously on demand at render time."
     ;; Only fetch queries not already cached from an earlier render.
     (setq queries
           (cl-remove-if-not
-           (lambda (q) (eq 'miss (gethash q betterdatadog--series-cache 'miss)))
+           (lambda (q) (eq 'miss (gethash (betterdatadog--query-cache-key q)
+                                          betterdatadog--series-cache 'miss)))
            queries)))
   (when (and queries betterdatadog--series-cache)
     (message "betterdatadog: fetching graph data (%d queries)..."
@@ -382,21 +594,34 @@ missing afterward are fetched synchronously on demand at render time."
            (api (betterdatadog--api-key))
            (app (betterdatadog--app-key))
            (remaining (vector (length queries))))
-      (dolist (q queries)
-        (let* ((url (format "https://%s/api/v1/query?from=%d&to=%d&query=%s"
-                            host from to (url-hexify-string q)))
-               (url-request-method "GET")
+      (dolist (spec queries)
+        (let* ((key (betterdatadog--query-cache-key spec))
                (url-request-extra-headers
                 `(("DD-API-KEY" . ,api)
                   ("DD-APPLICATION-KEY" . ,app)
-                  ("Accept" . "application/json"))))
+                  ("Accept" . "application/json")))
+               (url-request-method "GET")
+               (url-request-data nil)
+               url parser)
+          (if (stringp spec)
+              (setq url (format "https://%s/api/v1/query?from=%d&to=%d&query=%s"
+                                host from to (url-hexify-string spec))
+                    parser (lambda (parsed) (alist-get 'series parsed)))
+            (let ((req (betterdatadog--analytics-request spec)))
+              (setq url (concat "https://" host (car req))
+                    url-request-method "POST"
+                    url-request-extra-headers
+                    (append url-request-extra-headers
+                            '(("Content-Type" . "application/json")))
+                    url-request-data (json-encode (cdr req))
+                    parser #'betterdatadog--analytics-series-from-response)))
           (url-retrieve
            url
-           (lambda (status query)
+           (lambda (status cache-key parse-fn)
              (unwind-protect
                  (unless (plist-get status :error)
                    (goto-char (point-min))
-                   (when (re-search-forward "\n\n\\|\r\n\r\n" nil t)
+                   (when (re-search-forward "\n\n\|\r\n\r\n" nil t)
                      (let* ((json-object-type 'alist)
                             (json-array-type 'list)
                             (json-key-type 'symbol)
@@ -405,10 +630,11 @@ missing afterward are fetched synchronously on demand at render time."
                                     (point) (point-max))
                                    'utf-8))
                             (parsed (ignore-errors (json-read-from-string body))))
-                       (puthash query (alist-get 'series parsed) cache))))
+                       (when parsed
+                         (puthash cache-key (funcall parse-fn parsed) cache)))))
                (aset remaining 0 (1- (aref remaining 0)))
                (kill-buffer (current-buffer))))
-           (list q) t t)))
+           (list key parser) t t)))
       (let ((deadline (+ (float-time) betterdatadog-fetch-timeout)))
         (while (and (> (aref remaining 0) 0) (< (float-time) deadline))
           (accept-process-output nil 0.05))))))
@@ -518,8 +744,7 @@ Errors and empty results degrade to a short note rather than aborting
 the surrounding render."
   (let ((pad (make-string (+ indent 2) ?\s)))
     (condition-case err
-        (let ((series (betterdatadog--query-series
-                       (betterdatadog--resolve-query query))))
+        (let ((series (betterdatadog--query-series query)))
           (if (null series)
               (insert (propertize (concat pad "· (no data)\n")
                                   'face 'betterdatadog-meta-face))
@@ -530,6 +755,29 @@ the surrounding render."
       (error
        (insert (propertize
                 (format "%s· (graph unavailable: %s)\n"
+                        pad (error-message-string err))
+                'face 'betterdatadog-meta-face))))))
+
+(defun betterdatadog--last-number (values)
+  "Return the last numeric value in VALUES, or nil."
+  (car (last (delq nil (mapcar (lambda (v) (and (numberp v) v)) values)))))
+
+(defun betterdatadog--series-last-number (series)
+  "Return the last numeric value from the first SERIES pointlist."
+  (when series
+    (betterdatadog--last-number
+     (mapcar (lambda (p) (nth 1 p)) (alist-get 'pointlist (car series))))))
+
+(defun betterdatadog--insert-scalar (query indent window-seconds)
+  "Resolve QUERY, fetch its scalar value, and insert it at INDENT."
+  (let ((pad (make-string (+ indent 2) ?\s)))
+    (condition-case err
+        (let ((v (betterdatadog--query-scalar query window-seconds)))
+          (insert (propertize (concat pad "= " (betterdatadog--fmt v) "\n")
+                              'face 'betterdatadog-meta-face)))
+      (error
+       (insert (propertize
+                (format "%s· (value unavailable: %s)\n"
                         pad (error-message-string err))
                 'face 'betterdatadog-meta-face))))))
 
@@ -545,8 +793,7 @@ the surrounding render."
   "Fetch resolved QUERY and return a hash of TIMESTAMP -> value (first series).
 Timestamps are truncated to integer milliseconds so series from separate
 requests align exactly.  Returns nil when there is no data."
-  (let ((series (betterdatadog--query-series
-                 (betterdatadog--resolve-query query))))
+  (let ((series (betterdatadog--query-series query)))
     (when series
       (let ((h (make-hash-table :test 'eql)))
         (dolist (p (alist-get 'pointlist (car series)))
@@ -732,10 +979,62 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
                         pad (error-message-string err))
                 'face 'betterdatadog-meta-face))))))
 
+(defun betterdatadog--build-scalar-env (qmap window-seconds)
+  "Fetch every query in QMAP as a scalar over WINDOW-SECONDS."
+  (mapcar (lambda (pair)
+            (cons (car pair) (betterdatadog--query-scalar
+                              (cdr pair) window-seconds)))
+          qmap))
+
+(defun betterdatadog--insert-formula-scalar (formula qmap indent window-seconds)
+  "Evaluate FORMULA over scalar QMAP values and insert the result."
+  (let ((pad (make-string (+ indent 2) ?\s)))
+    (condition-case err
+        (let* ((env (betterdatadog--build-scalar-env qmap window-seconds))
+               (v (betterdatadog--eval-formula formula env)))
+          (insert (propertize (concat pad "= " (betterdatadog--fmt v) "\n")
+                              'face 'betterdatadog-meta-face)))
+      (error
+       (insert (propertize
+                (format "%s· (value unavailable: %s)\n"
+                        pad (error-message-string err))
+                'face 'betterdatadog-meta-face))))))
+
 ;;;; Rendering
 
-(defun betterdatadog--insert-query (request indent)
-  "Insert the query/queries found in REQUEST alist at INDENT spaces."
+(defun betterdatadog--title-duration (title)
+  "Return duration in seconds from TITLE text like \"(15m)\", or nil."
+  (and (stringp title)
+       (string-match "(\\([0-9]+[smhdw]\\))" title)
+       (betterdatadog--parse-duration (match-string 1 title))))
+
+(defun betterdatadog--group-scalar-window (widgets)
+  "Return the first explicit query_value duration among WIDGETS."
+  (catch 'found
+    (dolist (w widgets)
+      (let* ((def (alist-get 'definition w))
+             (type (alist-get 'type def)))
+        (cond
+         ((equal type "query_value")
+          (let ((duration (betterdatadog--title-duration
+                           (alist-get 'title def))))
+            (when duration (throw 'found duration))))
+         ((equal type "group")
+          (let ((duration (betterdatadog--group-scalar-window
+                           (alist-get 'widgets def))))
+            (when duration (throw 'found duration)))))))))
+
+(defun betterdatadog--scalar-window-for-widget (type title inherited-window)
+  "Return scalar query window in seconds for widget TYPE and TITLE."
+  (when (string= type "query_value")
+    (or (betterdatadog--title-duration title)
+        inherited-window
+        betterdatadog-graph-window-seconds)))
+
+(defun betterdatadog--insert-query (request indent &optional scalar-window)
+  "Insert the query/queries found in REQUEST alist at INDENT spaces.
+When SCALAR-WINDOW is non-nil, render values as numbers over that window
+instead of charts."
   (let ((pad (make-string indent ?\s)))
     (cond
      ;; Classic single-query form: { "q": "avg:system.cpu..." }
@@ -746,7 +1045,9 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
           (insert (propertize q 'face 'betterdatadog-query-face))
           (insert "\n"))
         (when betterdatadog-show-graphs
-          (betterdatadog--insert-graph q indent))))
+          (if scalar-window
+              (betterdatadog--insert-scalar q indent scalar-window)
+            (betterdatadog--insert-graph q indent)))))
      ;; Formula/query form: { "queries": [...], "formulas": [...] }
      ((alist-get 'queries request)
       (let* ((queries (alist-get 'queries request))
@@ -755,17 +1056,17 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
                          (mapcar
                           (lambda (query)
                             (let ((name (alist-get 'name query))
-                                  (q (or (alist-get 'query query)
-                                         (alist-get 'q query))))
-                              (when (and name q) (cons name q))))
+                                  (spec (betterdatadog--query-spec query)))
+                              (when (and name spec) (cons name spec))))
                           queries))))
         ;; List each underlying query for transparency.
         (when betterdatadog-show-queries
           (dolist (query queries)
-            (let ((q (or (alist-get 'query query) (alist-get 'q query))))
-              (when q
+            (let ((spec (betterdatadog--query-spec query)))
+              (when spec
                 (insert pad)
-                (insert (propertize q 'face 'betterdatadog-query-face))
+                (insert (propertize (betterdatadog--spec-query spec)
+                                    'face 'betterdatadog-query-face))
                 (insert "\n")))))
         (when betterdatadog-show-graphs
           (if (and formulas qmap)
@@ -778,16 +1079,24 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
                        (bare (and fs (assoc (string-trim fs) qmap))))
                   (cond
                    ((null fs) nil)
-                   (bare (betterdatadog--insert-graph (cdr bare) indent))
+                   (bare
+                    (if scalar-window
+                        (betterdatadog--insert-scalar (cdr bare) indent scalar-window)
+                      (betterdatadog--insert-graph (cdr bare) indent)))
                    (t
                     (when betterdatadog-show-queries
                       (insert (propertize (concat pad "  ↳ " fs "\n")
                                           'face 'betterdatadog-meta-face)))
-                    (betterdatadog--insert-formula-graph fs qmap indent)))))
+                    (if scalar-window
+                        (betterdatadog--insert-formula-scalar fs qmap indent scalar-window)
+                      (betterdatadog--insert-formula-graph fs qmap indent))))))
             ;; No formulas: chart each query directly.
             (dolist (query queries)
-              (let ((q (or (alist-get 'query query) (alist-get 'q query))))
-                (when q (betterdatadog--insert-graph q indent))))))))
+              (let ((spec (betterdatadog--query-spec query)))
+                (when spec
+                  (if scalar-window
+                      (betterdatadog--insert-scalar spec indent scalar-window)
+                    (betterdatadog--insert-graph spec indent)))))))))
      ;; Log/event style: { "log_query": { "search": { "query": "..." } } }
      (betterdatadog-show-queries
       (dolist (key '(log_query rum_query apm_query process_query network_query
@@ -802,8 +1111,10 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
                                     'face 'betterdatadog-query-face))
                 (insert "\n"))))))))))
 
-(defun betterdatadog--insert-widget (widget depth)
-  "Insert a representation of WIDGET (an alist) at nesting DEPTH."
+(defun betterdatadog--insert-widget (widget depth &optional scalar-window-context)
+  "Insert WIDGET at nesting DEPTH.
+SCALAR-WINDOW-CONTEXT is inherited by query_value children without their
+own explicit duration in the title."
   (let* ((def (alist-get 'definition widget))
          (type (or (alist-get 'type def) "unknown"))
          (title (or (alist-get 'title def) ""))
@@ -818,8 +1129,11 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
     (cond
      ;; Group widgets nest more widgets.
      ((string= type "group")
-      (dolist (child (alist-get 'widgets def))
-        (betterdatadog--insert-widget child (1+ depth))))
+      (let ((group-window (or scalar-window-context
+                              (betterdatadog--group-scalar-window
+                               (alist-get 'widgets def)))))
+        (dolist (child (alist-get 'widgets def))
+          (betterdatadog--insert-widget child (1+ depth) group-window))))
      ;; Note widgets carry markdown content.
      ((string= type "note")
       (let ((content (alist-get 'content def)))
@@ -831,13 +1145,15 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
           (insert "\n"))))
      ;; Everything else: render its requests/queries.
      (t
-      (let ((requests (alist-get 'requests def)))
+      (let ((requests (alist-get 'requests def))
+            (scalar-window (betterdatadog--scalar-window-for-widget
+                            type title scalar-window-context)))
         (cond
          ((listp requests)
           (dolist (req requests)
-            (betterdatadog--insert-query req (+ indent 2))))
+            (betterdatadog--insert-query req (+ indent 2) scalar-window)))
          (requests
-          (betterdatadog--insert-query requests (+ indent 2)))))))))
+          (betterdatadog--insert-query requests (+ indent 2) scalar-window))))))))
 
 (defun betterdatadog--render-dashboard (dashboard)
   "Render DASHBOARD (parsed API alist) into the current buffer."
