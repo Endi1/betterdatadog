@@ -92,6 +92,18 @@ Results open in a `special-mode` buffer (so `q` quits and `g` re-runs the
 search), one entry per event. Past searches are remembered and offered for
 completion (`TAB`) on later calls.
 
+To inspect a single event, put point on its entry and run
+`betterdatadog-logs-show-detail` — it opens a buffer with the event's full
+fields and attributes (including nested objects, tags, and the parsed log
+content) as an indented tree. Like the rest of the package it ships no
+binding, so wire it up yourself, e.g. to `RET`:
+
+```elisp
+(with-eval-after-load 'betterdatadog
+  (define-key betterdatadog-logs-mode-map (kbd "RET")
+              #'betterdatadog-logs-show-detail))
+```
+
 The search covers the last `betterdatadog-log-search-window-seconds` (default
 15 minutes). Change it for the current buffer with `betterdatadog-set-window`
 (the same command used for dashboard graphs — it adapts to the buffer it's run
@@ -110,6 +122,7 @@ however you like. The interactive commands are:
 | `betterdatadog-toggle-queries`   | Toggle the query strings on/off         |
 | `betterdatadog-set-window`       | Set the time window (`30m`/`4h`…)        |
 | `betterdatadog-search-logs`      | Search logs and list matching events    |
+| `betterdatadog-logs-show-detail` | Show the log event at point's full fields|
 
 `betterdatadog-toggle-queries` hides the metric query text for a clean,
 graph-only view (`betterdatadog-show-queries`, default `t`). Toggling

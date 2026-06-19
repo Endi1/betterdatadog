@@ -1418,14 +1418,17 @@ exposing common fields like `service' at the top level, so check both."
     "—"))
 
 (defun betterdatadog--insert-log-event (event)
-  "Insert a single log EVENT alist as one or more lines."
+  "Insert a single log EVENT alist as one or more lines.
+The whole entry carries EVENT as a text property so
+`betterdatadog-logs-show-detail' can recover it from point."
   (let* ((attrs (alist-get 'attributes event))
          (status (or (betterdatadog--log-field attrs 'status) ""))
          (service (or (betterdatadog--log-field attrs 'service) ""))
          (host (betterdatadog--log-field attrs 'host))
          (time (betterdatadog--format-log-time
                 (betterdatadog--log-field attrs 'timestamp)))
-         (message (or (betterdatadog--log-field attrs 'message) "")))
+         (message (or (betterdatadog--log-field attrs 'message) ""))
+         (start (point)))
     (insert (propertize (format "%-19s " time) 'face 'betterdatadog-meta-face))
     (insert (propertize (format "%-9s" (upcase status))
                         'face (betterdatadog--log-status-face status)))
@@ -1437,7 +1440,11 @@ exposing common fields like `service' at the top level, so check both."
     (when (and message (stringp message) (> (length (string-trim message)) 0))
       (insert (replace-regexp-in-string
                "^" "    " (string-trim-right message))
-              "\n"))))
+              "\n"))
+    (add-text-properties
+     start (point)
+     (list 'betterdatadog-log-event event
+           'help-echo "RET: show this event's fields and attributes"))))
 
 (defun betterdatadog--render-logs (query events window-seconds)
   "Render log search results EVENTS for QUERY into the current buffer."
@@ -1459,6 +1466,83 @@ exposing common fields like `service' at the top level, so check both."
                             'face 'betterdatadog-meta-face))
       (dolist (event events)
         (betterdatadog--insert-log-event event)))
+    (goto-char (point-min))))
+
+(defvar betterdatadog--log-detail-buffer-name "*Datadog Log*"
+  "Name of the buffer used to show a single log event's details.")
+
+(defun betterdatadog--alist-p (value)
+  "Return non-nil if VALUE looks like a parsed JSON object (an alist).
+Detects a list whose first element is a (SYMBOL . _) cons, as produced by
+`json-read' with `json-object-type' set to `alist'."
+  (and (consp value)
+       (consp (car value))
+       (symbolp (caar value))))
+
+(defun betterdatadog--log-leaf-string (value)
+  "Render a non-collection log VALUE as a display string."
+  (cond
+   ((stringp value) value)
+   ((numberp value) (format "%s" value))
+   ((eq value t) "true")
+   ((eq value :json-false) "false")
+   ((null value) "—")
+   ((symbolp value) (symbol-name value))
+   (t (format "%S" value))))
+
+(defun betterdatadog--insert-log-node (label value indent)
+  "Insert a log detail node for VALUE at INDENT, prefixed by optional LABEL.
+Recurses into nested objects (alists) and arrays (lists); any other value
+is printed as a single field, with continuation lines kept aligned."
+  (let ((pad (make-string indent ?\s)))
+    (cond
+     ;; Nested object: print the label, then each pair one level deeper.
+     ((betterdatadog--alist-p value)
+      (when label
+        (insert pad (propertize (concat label ":")
+                                'face 'betterdatadog-widget-title-face)
+                "\n"))
+      (dolist (pair value)
+        (betterdatadog--insert-log-node (symbol-name (car pair)) (cdr pair)
+                                        (if label (+ indent 2) indent))))
+     ;; Non-empty array.
+     ((consp value)
+      (when label
+        (insert pad (propertize (concat label ":")
+                                'face 'betterdatadog-widget-title-face)
+                "\n"))
+      (let ((item-indent (if label (+ indent 2) indent)))
+        (dolist (item value)
+          (if (consp item)
+              (betterdatadog--insert-log-node nil item item-indent)
+            (insert (make-string item-indent ?\s)
+                    "- " (betterdatadog--log-leaf-string item) "\n")))))
+     ;; Leaf value.
+     (t
+      (insert pad)
+      (when label
+        (insert (propertize (concat label ": ") 'face 'betterdatadog-meta-face)))
+      (insert (replace-regexp-in-string
+               "\n" (concat "\n" pad "  ")
+               (betterdatadog--log-leaf-string value))
+              "\n")))))
+
+(defun betterdatadog--render-log-detail (event)
+  "Render the full fields and attributes of log EVENT into the current buffer."
+  (let* ((inhibit-read-only t)
+         (attrs (alist-get 'attributes event))
+         (service (or (betterdatadog--log-field attrs 'service) "(log event)"))
+         (status (or (betterdatadog--log-field attrs 'status) ""))
+         (time (betterdatadog--format-log-time
+                (betterdatadog--log-field attrs 'timestamp)))
+         (heading (string-trim (format "%s    %s    %s"
+                                       time (upcase status) service))))
+    (erase-buffer)
+    (insert (propertize heading 'face 'betterdatadog-title-face) "\n")
+    (insert (propertize (make-string (max 8 (length heading)) ?─)
+                        'face 'betterdatadog-meta-face)
+            "\n\n")
+    (betterdatadog--insert-log-node nil event 0)
     (goto-char (point-min))))
 
 ;;;; Mode and entry points
@@ -1571,7 +1655,12 @@ and offered for completion on subsequent calls."
 
 Intentionally empty, like `betterdatadog-mode-map': betterdatadog ships no
 key bindings of its own.  Standard `special-mode' keys remain available
-\(e.g. \\`q' to quit, \\`g' to re-run the search).")
+\(e.g. \\`q' to quit, \\`g' to re-run the search).  To open the event at
+point in a detail buffer, bind `betterdatadog-logs-show-detail', e.g.:
+
+  (with-eval-after-load \\='betterdatadog
+    (define-key betterdatadog-logs-mode-map (kbd \"RET\")
+                #\\='betterdatadog-logs-show-detail))")
 
 (define-derived-mode betterdatadog-logs-mode special-mode "Datadog Logs"
   "Major mode for viewing Datadog log search results.
@@ -1616,6 +1705,23 @@ subsequent calls."
     (pop-to-buffer buffer)
     (message "betterdatadog: %d log event%s" (length events)
              (if (= (length events) 1) "" "s"))))
+
+(defun betterdatadog-logs-show-detail ()
+  "Show the full fields and attributes of the log event at point.
+Run in a `betterdatadog-logs-mode' buffer (e.g. bound to RET); the event
+under point is rendered as an indented field tree in a separate buffer."
+  (interactive)
+  (let ((event (or (get-text-property (point) 'betterdatadog-log-event)
+                   (get-text-property (line-beginning-position)
+                                      'betterdatadog-log-event))))
+    (unless event
+      (user-error "No log event at point"))
+    (let ((buffer (get-buffer-create betterdatadog--log-detail-buffer-name)))
+      (with-current-buffer buffer
+        (unless (derived-mode-p 'special-mode)
+          (special-mode))
+        (betterdatadog--render-log-detail event))
+      (pop-to-buffer buffer))))
 
 (defun betterdatadog--current-window-seconds ()
   "Return the time window in seconds relevant to the current buffer.
