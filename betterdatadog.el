@@ -125,6 +125,33 @@ current Emacs session)."
   :type '(choice (const :tag "Do not persist" nil) file)
   :group 'betterdatadog)
 
+(defcustom betterdatadog-logs-buffer-name "*Datadog Logs*"
+  "Name of the buffer used to display log search results."
+  :type 'string
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-log-search-window-seconds 900
+  "Length of the time window, in seconds, searched for log events.
+Defaults to the last 15 minutes."
+  :type 'integer
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-log-search-limit 100
+  "Maximum number of log events fetched per search.
+Datadog caps a single page at 1000."
+  :type 'integer
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-log-search-history-file
+  (locate-user-emacs-file "betterdatadog-log-searches.el")
+  "File where log search queries are remembered.
+Each query that is searched without error is stored here so
+`betterdatadog-search-logs' can offer it for completion next time instead
+of requiring you to retype it.  Set to nil to disable persistence
+\(queries are then remembered only for the current Emacs session)."
+  :type '(choice (const :tag "Do not persist" nil) file)
+  :group 'betterdatadog)
+
 ;;;; Faces
 
 (defface betterdatadog-title-face
@@ -155,6 +182,21 @@ current Emacs session)."
 (defface betterdatadog-graph-face
   '((t :inherit font-lock-constant-face))
   "Face for the sparkline glyphs."
+  :group 'betterdatadog)
+
+(defface betterdatadog-log-error-face
+  '((t :inherit error))
+  "Face for the status of error/critical log events."
+  :group 'betterdatadog)
+
+(defface betterdatadog-log-warn-face
+  '((t :inherit warning))
+  "Face for the status of warning log events."
+  :group 'betterdatadog)
+
+(defface betterdatadog-log-info-face
+  '((t :inherit shadow))
+  "Face for the status of info/debug log events."
   :group 'betterdatadog)
 
 ;;;; Authentication / configuration helpers
@@ -1278,6 +1320,147 @@ allowed, so a brand-new id can still be pasted in."
       nil nil nil
       'betterdatadog--id-prompt-history))))
 
+;;;; Log search
+
+(defvar betterdatadog--log-search-history nil
+  "List of remembered log search query strings, most recent first.
+Populated from `betterdatadog-log-search-history-file' on first use and
+updated whenever a search runs successfully.")
+
+(defvar betterdatadog--log-search-loaded nil
+  "Non-nil once `betterdatadog-log-search-history-file' has been read.")
+
+(defvar betterdatadog--log-search-prompt-history nil
+  "Minibuffer history of log search queries entered this session.")
+
+(defun betterdatadog--load-log-searches ()
+  "Load remembered log searches from `betterdatadog-log-search-history-file'.
+Reads the file at most once per session; a missing or unreadable file is
+treated as an empty history.  Returns `betterdatadog--log-search-history'."
+  (unless betterdatadog--log-search-loaded
+    (setq betterdatadog--log-search-loaded t)
+    (when (and betterdatadog-log-search-history-file
+               (file-readable-p betterdatadog-log-search-history-file))
+      (with-demoted-errors "betterdatadog: could not read log searches: %S"
+        (with-temp-buffer
+          (insert-file-contents betterdatadog-log-search-history-file)
+          (let ((data (read (current-buffer))))
+            (when (listp data)
+              (setq betterdatadog--log-search-history data)))))))
+  betterdatadog--log-search-history)
+
+(defun betterdatadog--save-log-searches ()
+  "Write `betterdatadog--log-search-history' to its history file."
+  (when betterdatadog-log-search-history-file
+    (with-demoted-errors "betterdatadog: could not save log searches: %S"
+      (let ((dir (file-name-directory betterdatadog-log-search-history-file)))
+        (when (and dir (not (file-directory-p dir)))
+          (make-directory dir t)))
+      (with-temp-file betterdatadog-log-search-history-file
+        (insert ";; betterdatadog log search history -*- lexical-binding: t; -*-\n")
+        (insert ";; Auto-generated; edit at your own risk.\n")
+        (prin1 betterdatadog--log-search-history (current-buffer))
+        (insert "\n")))))
+
+(defun betterdatadog--remember-log-search (query)
+  "Record that log search QUERY ran successfully.
+Moves QUERY to the front of the history and persists it."
+  (betterdatadog--load-log-searches)
+  (setq betterdatadog--log-search-history
+        (cons query (delete query betterdatadog--log-search-history)))
+  (betterdatadog--save-log-searches))
+
+(defun betterdatadog--read-log-search ()
+  "Prompt for a log search query, offering remembered ones for completion.
+Free input is allowed, so a brand-new query can still be typed in."
+  (betterdatadog--load-log-searches)
+  (let ((history betterdatadog--log-search-history))
+    (string-trim
+     (completing-read
+      (if history
+          "Datadog log search (TAB for past searches, empty for all): "
+        "Datadog log search (empty for all): ")
+      history
+      nil nil nil
+      'betterdatadog--log-search-prompt-history))))
+
+(defun betterdatadog--search-logs (query limit window-seconds)
+  "Search Datadog logs for QUERY over the last WINDOW-SECONDS.
+Return up to LIMIT events (a list of API alists), newest first."
+  (let ((body `((filter . ((query . ,query)
+                           (from . ,(format "now-%ds" window-seconds))
+                           (to . "now")))
+                (sort . "-timestamp")
+                (page . ((limit . ,limit))))))
+    (alist-get 'data
+               (betterdatadog--post-json "/api/v2/logs/events/search" body))))
+
+(defun betterdatadog--log-field (attrs key)
+  "Return KEY from a log event's ATTRS, falling back to its nested attributes.
+Datadog nests the parsed log content under an inner `attributes' map while
+exposing common fields like `service' at the top level, so check both."
+  (or (alist-get key attrs)
+      (alist-get key (alist-get 'attributes attrs))))
+
+(defun betterdatadog--log-status-face (status)
+  "Return the face for a log STATUS string."
+  (pcase (and (stringp status) (downcase status))
+    ((or "emergency" "alert" "critical" "error") 'betterdatadog-log-error-face)
+    ((or "warning" "warn" "notice") 'betterdatadog-log-warn-face)
+    (_ 'betterdatadog-log-info-face)))
+
+(defun betterdatadog--format-log-time (timestamp)
+  "Format an ISO TIMESTAMP as a local time string, or return it unchanged."
+  (if (stringp timestamp)
+      (condition-case nil
+          (format-time-string "%Y-%m-%d %H:%M:%S" (date-to-time timestamp))
+        (error timestamp))
+    "—"))
+
+(defun betterdatadog--insert-log-event (event)
+  "Insert a single log EVENT alist as one or more lines."
+  (let* ((attrs (alist-get 'attributes event))
+         (status (or (betterdatadog--log-field attrs 'status) ""))
+         (service (or (betterdatadog--log-field attrs 'service) ""))
+         (host (betterdatadog--log-field attrs 'host))
+         (time (betterdatadog--format-log-time
+                (betterdatadog--log-field attrs 'timestamp)))
+         (message (or (betterdatadog--log-field attrs 'message) "")))
+    (insert (propertize (format "%-19s " time) 'face 'betterdatadog-meta-face))
+    (insert (propertize (format "%-9s" (upcase status))
+                        'face (betterdatadog--log-status-face status)))
+    (insert " ")
+    (insert (propertize service 'face 'betterdatadog-widget-title-face))
+    (when (and host (stringp host) (> (length host) 0))
+      (insert (propertize (concat " @" host) 'face 'betterdatadog-meta-face)))
+    (insert "\n")
+    (when (and message (stringp message) (> (length (string-trim message)) 0))
+      (insert (replace-regexp-in-string
+               "^" "    " (string-trim-right message))
+              "\n"))))
+
+(defun betterdatadog--render-logs (query events window-seconds)
+  "Render log search results EVENTS for QUERY into the current buffer."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (let ((heading (if (string-empty-p query) "(all logs)" query)))
+      (insert (propertize heading 'face 'betterdatadog-title-face) "\n")
+      (insert (propertize (make-string (max 8 (length heading)) ?─)
+                          'face 'betterdatadog-meta-face)
+              "\n"))
+    (insert (propertize
+             (format "events: %d    window: last %s"
+                     (length events)
+                     (betterdatadog--format-duration window-seconds))
+             'face 'betterdatadog-meta-face)
+            "\n\n")
+    (if (null events)
+        (insert (propertize "(no matching log events)\n"
+                            'face 'betterdatadog-meta-face))
+      (dolist (event events)
+        (betterdatadog--insert-log-event event)))
+    (goto-char (point-min))))
+
 ;;;; Mode and entry points
 
 (defvar betterdatadog--current-dashboard-id nil
@@ -1318,27 +1501,8 @@ Re-renders from the cached dashboard and graph data, so this is instant."
   (message "betterdatadog: queries %s"
            (if betterdatadog-show-queries "shown" "hidden")))
 
-(defun betterdatadog-set-window (window)
-  "Set the graph time window to WINDOW (this buffer) and re-render.
-WINDOW is duration shorthand like \"30m\", \"1h\", \"4h\", or \"1d\"; a
-bare number is seconds.  Re-renders from the cached dashboard when
-available, so only graph data is re-fetched."
-  (interactive
-   (list (read-string
-          (format "Graph window (e.g. 30m, 1h, 4h, 1d) [current %s]: "
-                  (betterdatadog--format-duration
-                   betterdatadog-graph-window-seconds)))))
-  (let ((secs (betterdatadog--parse-duration window)))
-    (when (<= secs 0)
-      (user-error "Window must be positive"))
-    (setq-local betterdatadog-graph-window-seconds secs)
-    ;; The window changed, so cached series no longer match; force a refetch.
-    (setq betterdatadog--series-cache nil)
-    (if betterdatadog--current-dashboard
-        (betterdatadog--render-dashboard betterdatadog--current-dashboard)
-      (betterdatadog-refresh))
-    (message "betterdatadog: graph window set to %s"
-             (betterdatadog--format-duration secs))))
+;; `betterdatadog-set-window' is defined at the end of the file, after the
+;; log-search entry points, so it can dispatch on either buffer type.
 
 (defvar betterdatadog-mode-map (make-sparse-keymap)
   "Keymap for `betterdatadog-mode'.
@@ -1397,6 +1561,102 @@ and offered for completion on subsequent calls."
       (betterdatadog--render-dashboard dashboard))
     (pop-to-buffer buffer)
     (message "betterdatadog: showing dashboard %s" dashboard-id)))
+
+(defvar betterdatadog--current-log-query nil
+  "The log search query currently displayed in the buffer, for refresh.")
+(make-variable-buffer-local 'betterdatadog--current-log-query)
+
+(defvar betterdatadog-logs-mode-map (make-sparse-keymap)
+  "Keymap for `betterdatadog-logs-mode'.
+
+Intentionally empty, like `betterdatadog-mode-map': betterdatadog ships no
+key bindings of its own.  Standard `special-mode' keys remain available
+\(e.g. \\`q' to quit, \\`g' to re-run the search).")
+
+(define-derived-mode betterdatadog-logs-mode special-mode "Datadog Logs"
+  "Major mode for viewing Datadog log search results.
+
+\\{betterdatadog-logs-mode-map}"
+  (setq-local revert-buffer-function
+              (lambda (&rest _)
+                (when betterdatadog--current-log-query
+                  (betterdatadog-search-logs betterdatadog--current-log-query))))
+  (setq truncate-lines nil))
+
+;;;###autoload
+(defun betterdatadog-search-logs (query)
+  "Search Datadog logs for QUERY and display the matching events.
+
+Prompts for the search interactively, offering previously-used searches
+for completion (an empty query matches everything).  The search is run
+over the last `betterdatadog-log-search-window-seconds' and at most
+`betterdatadog-log-search-limit' events are shown, newest first.
+
+Queries that run successfully are remembered in
+`betterdatadog-log-search-history-file' and offered for completion on
+subsequent calls."
+  (interactive (list (betterdatadog--read-log-search)))
+  (setq query (string-trim query))
+  (message "betterdatadog: searching logs%s..."
+           (if (string-empty-p query) "" (format " for %s" query)))
+  (let ((events (betterdatadog--search-logs
+                 query
+                 betterdatadog-log-search-limit
+                 betterdatadog-log-search-window-seconds))
+        (buffer (get-buffer-create betterdatadog-logs-buffer-name)))
+    ;; The search succeeded, so remember a non-empty query for next time.
+    (unless (string-empty-p query)
+      (betterdatadog--remember-log-search query))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'betterdatadog-logs-mode)
+        (betterdatadog-logs-mode))
+      (setq betterdatadog--current-log-query query)
+      (betterdatadog--render-logs
+       query events betterdatadog-log-search-window-seconds))
+    (pop-to-buffer buffer)
+    (message "betterdatadog: %d log event%s" (length events)
+             (if (= (length events) 1) "" "s"))))
+
+(defun betterdatadog--current-window-seconds ()
+  "Return the time window in seconds relevant to the current buffer.
+A logs buffer uses the log search window; anything else (a dashboard) uses
+the graph window."
+  (if (derived-mode-p 'betterdatadog-logs-mode)
+      betterdatadog-log-search-window-seconds
+    betterdatadog-graph-window-seconds))
+
+(defun betterdatadog-set-window (window)
+  "Set the time window for this buffer to WINDOW and refresh.
+In a dashboard buffer this is the graph window; in a logs buffer it is the
+window the log search covers.  WINDOW is duration shorthand like \"30m\",
+\"1h\", \"4h\", or \"1d\"; a bare number is seconds.
+
+The change is buffer-local, and the buffer is refreshed over the new
+window: a dashboard re-renders from its cached definition (only graph data
+is re-fetched), a logs buffer re-runs its current search."
+  (interactive
+   (list (read-string
+          (format "Time window (e.g. 30m, 1h, 4h, 1d) [current %s]: "
+                  (betterdatadog--format-duration
+                   (betterdatadog--current-window-seconds))))))
+  (let ((secs (betterdatadog--parse-duration window)))
+    (when (<= secs 0)
+      (user-error "Window must be positive"))
+    (cond
+     ((derived-mode-p 'betterdatadog-logs-mode)
+      (unless betterdatadog--current-log-query
+        (user-error "No log search associated with this buffer"))
+      (setq-local betterdatadog-log-search-window-seconds secs)
+      (betterdatadog-search-logs betterdatadog--current-log-query))
+     (t
+      (setq-local betterdatadog-graph-window-seconds secs)
+      ;; The window changed, so cached series no longer match; force a refetch.
+      (setq betterdatadog--series-cache nil)
+      (if betterdatadog--current-dashboard
+          (betterdatadog--render-dashboard betterdatadog--current-dashboard)
+        (betterdatadog-refresh))))
+    (message "betterdatadog: window set to %s"
+             (betterdatadog--format-duration secs))))
 
 (provide 'betterdatadog)
 

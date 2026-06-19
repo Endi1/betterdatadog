@@ -23,6 +23,16 @@ A better Datadog client for Emacs.
   remembered dashboard instead of pasting the id again. Set the variable to
   `nil` to disable persistence.
 
+- **`betterdatadog-search-logs`** — search Datadog logs from Emacs. It prompts
+  for a query, runs it against the Logs Search API, and lists the matching
+  events (timestamp, status, service, host, and message) newest-first in a
+  buffer. Every query that runs successfully is saved to
+  `betterdatadog-log-search-history-file`, so next time you can hit `TAB` at the
+  prompt and pick a past search instead of retyping it (an empty query matches
+  everything). The window (`betterdatadog-log-search-window-seconds`, default
+  the last 15 minutes) and page size (`betterdatadog-log-search-limit`, default
+  `100`) are configurable.
+
 More to come (monitors, metric explorer).
 
 ## Install
@@ -70,6 +80,24 @@ the dashboard title) instead of pasting the id again.
 The dashboard buffer derives from `special-mode`, so the usual read-only
 keys apply (`q` quits, `g` reverts/refreshes, `SPC`/`DEL` scroll).
 
+### Searching logs
+
+```
+M-x betterdatadog-search-logs RET <query> RET
+```
+
+The query is a Datadog [log search](https://docs.datadoghq.com/logs/explorer/search_syntax/)
+string, e.g. `service:web status:error`; leave it empty to match everything.
+Results open in a `special-mode` buffer (so `q` quits and `g` re-runs the
+search), one entry per event. Past searches are remembered and offered for
+completion (`TAB`) on later calls.
+
+The search covers the last `betterdatadog-log-search-window-seconds` (default
+15 minutes). Change it for the current buffer with `betterdatadog-set-window`
+(the same command used for dashboard graphs — it adapts to the buffer it's run
+in) and type a duration like `15m`, `1h`, `4h`, `1d`, or a bare number of
+seconds; the search re-runs over the new window.
+
 ### Commands and key bindings
 
 betterdatadog **ships no key bindings of its own** — bind the commands
@@ -80,7 +108,8 @@ however you like. The interactive commands are:
 | `betterdatadog-refresh`          | Re-fetch the board and graph data       |
 | `betterdatadog-toggle-graphs`    | Toggle graphs on/off                    |
 | `betterdatadog-toggle-queries`   | Toggle the query strings on/off         |
-| `betterdatadog-set-window`       | Set the graph time window (`30m`/`4h`…) |
+| `betterdatadog-set-window`       | Set the time window (`30m`/`4h`…)        |
+| `betterdatadog-search-logs`      | Search logs and list matching events    |
 
 `betterdatadog-toggle-queries` hides the metric query text for a clean,
 graph-only view (`betterdatadog-show-queries`, default `t`). Toggling
