@@ -41,6 +41,7 @@
 (require 'auth-source)
 (require 'subr-x)
 (require 'cl-lib)
+(require 'svg)
 
 (defgroup betterdatadog nil
   "A better Datadog client for Emacs."
@@ -105,6 +106,53 @@ Defaults to the last hour."
 A height of 1 yields a compact single-row sparkline; taller values give
 more vertical resolution (8 levels per row)."
   :type 'integer
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-graph-style 'auto
+  "How graphs are drawn.
+`auto' draws SVG images on a graphical display that supports them and
+Unicode block charts otherwise (e.g. in a terminal); `svg' and
+`unicode' force one or the other."
+  :type '(choice (const :tag "SVG when available" auto)
+                 (const :tag "SVG images" svg)
+                 (const :tag "Unicode block charts" unicode))
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-svg-height 140
+  "Height in pixels of the plot area of an SVG graph.
+Its width is `betterdatadog-sparkline-width' columns of text."
+  :type 'integer
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-series-colors
+  '("#3d9df2" "#f2933d" "#3dc47e" "#c46bd6" "#e6c229"
+    "#f25c6e" "#33c4c4" "#8f83f2" "#a3b833" "#f283b0")
+  "Colors given in turn to the series drawn on one SVG graph."
+  :type '(repeat color)
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-graph-include-zero t
+  "Non-nil means every graph's y-axis includes zero.
+Bar heights are then proportional to the values, as in Datadog's own
+graphs.  When nil the axis spans only the data's min..max, which
+magnifies small movements in a metric that sits far from zero."
+  :type 'boolean
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-graph-shared-scale t
+  "Non-nil means the series of one grouped query share a y-axis.
+The charts of a `by {tag}' query are then directly comparable, at the
+cost of flattening series much smaller than the largest.  When nil each
+series is scaled to its own range."
+  :type 'boolean
+  :group 'betterdatadog)
+
+(defcustom betterdatadog-max-series 10
+  "Maximum number of series charted for one grouped query.
+A `by {tag}' query returns one series per tag combination; when there
+are more than this many, only those with the highest averages are drawn
+and the rest are counted in a note.  Nil means no limit."
+  :type '(choice (const :tag "No limit" nil) integer)
   :group 'betterdatadog)
 
 (defcustom betterdatadog-fetch-timeout 30
@@ -182,6 +230,11 @@ of requiring you to retype it.  Set to nil to disable persistence
 (defface betterdatadog-graph-face
   '((t :inherit font-lock-constant-face))
   "Face for the sparkline glyphs."
+  :group 'betterdatadog)
+
+(defface betterdatadog-series-face
+  '((t :inherit font-lock-variable-name-face))
+  "Face for the label naming each charted series."
   :group 'betterdatadog)
 
 (defface betterdatadog-log-error-face
@@ -283,6 +336,12 @@ Set while rendering and consulted by `betterdatadog--resolve-query'.")
 Populated up front in parallel by `betterdatadog--prefetch' and read by
 `betterdatadog--query-series' so each distinct query is fetched once.")
 (make-variable-buffer-local 'betterdatadog--series-cache)
+
+(defvar betterdatadog--window-end nil
+  "Time (float seconds since the epoch) at which the graph window ends.
+Set whenever `betterdatadog--series-cache' is created, i.e. when the
+data is fetched; charts place points on a time axis ending here.")
+(make-variable-buffer-local 'betterdatadog--window-end)
 
 (defconst betterdatadog--spark-levels "▁▂▃▄▅▆▇█"
   "Block-glyph ramp, lowest to highest, used to draw sparklines.")
@@ -495,31 +554,50 @@ When SCALAR is non-nil, request a single aggregate over WINDOW-SECONDS."
                  (append attrs (when group-by `((group_by . ,group-by)))))))
     (cons path body)))
 
+(defun betterdatadog--analytics-buckets (parsed)
+  "Return the buckets in analytics aggregate response PARSED.
+Each bucket is normalised to (BY . C0): its group-by alist and first
+compute value.  Handles both response shapes: logs nest buckets under
+`data.buckets' with a `computes' object, while spans return `data' as a
+list of buckets carrying `attributes.compute'."
+  (let* ((data (alist-get 'data parsed))
+         (logs (assq 'buckets data)))
+    (mapcar
+     (lambda (bucket)
+       (let ((attrs (or (alist-get 'attributes bucket) bucket)))
+         (cons (alist-get 'by attrs)
+               (alist-get 'c0 (or (alist-get 'computes attrs)
+                                  (alist-get 'compute attrs))))))
+     (if logs (cdr logs) data))))
+
 (defun betterdatadog--analytics-scalar-from-response (parsed)
   "Extract the first scalar compute value from an analytics response PARSED."
-  (let* ((data (alist-get 'data parsed))
-         (buckets (alist-get 'buckets (if (and (listp data) (alist-get 'attributes data))
-                                          (alist-get 'attributes data)
-                                        data)))
-         (computes (alist-get 'computes (car buckets)))
-         (c0 (alist-get 'c0 computes)))
+  (let ((c0 (cdr (car (betterdatadog--analytics-buckets parsed)))))
     (cond
      ((numberp c0) c0)
      ((and (listp c0) (listp (car c0)))
       (betterdatadog--last-number (mapcar (lambda (p) (alist-get 'value p)) c0)))
      (t nil))))
 
-(defun betterdatadog--analytics-series-from-response (parsed)
-  "Extract betterdatadog series from an analytics aggregate response PARSED."
-  (let* ((data (alist-get 'data parsed))
-         (buckets (alist-get 'buckets (if (and (listp data) (alist-get 'attributes data))
-                                          (alist-get 'attributes data)
-                                        data))))
+(defconst betterdatadog--nanosecond-unit
+  '(((family . "time") (name . "nanosecond") (short_name . "ns")
+     (scale_factor . 1e-9))
+    nil)
+  "Unit pair for span durations, shaped like a metric series `unit'.")
+
+(defun betterdatadog--analytics-series-from-response (parsed &optional spec)
+  "Extract betterdatadog series from an analytics aggregate response PARSED.
+Each series mirrors the metric-query shape: a `pointlist', the group
+tags as `tag_set', the sample `interval', and a `unit' when SPEC (the
+query spec that produced PARSED) measures span durations."
+  (let ((unit (and (equal (alist-get 'metric (plist-get spec :compute))
+                          "@duration")
+                   betterdatadog--nanosecond-unit))
+        (interval (max 60 (truncate (/ betterdatadog-graph-window-seconds 60)))))
     (delq nil
           (mapcar
            (lambda (bucket)
-             (let* ((computes (alist-get 'computes bucket))
-                    (c0 (alist-get 'c0 computes))
+             (let* ((c0 (cdr bucket))
                     (points (cond
                              ((and (listp c0) (listp (car c0)))
                               (mapcar (lambda (p)
@@ -530,14 +608,20 @@ When SCALAR is non-nil, request a single aggregate over WINDOW-SECONDS."
                              ((numberp c0)
                               (list (list (* 1000.0 (float-time)) c0)))
                              (t nil))))
-               (when points `((pointlist . ,points)))))
-           buckets))))
+               (when points
+                 `((pointlist . ,points)
+                   (tag_set . ,(mapcar (lambda (g)
+                                         (format "%s:%s" (car g) (cdr g)))
+                                       (car bucket)))
+                   (interval . ,interval)
+                   (unit . ,unit)))))
+           (betterdatadog--analytics-buckets parsed)))))
 
 (defun betterdatadog--fetch-analytics-series (spec)
   "Fetch logs/spans analytics time series for resolved SPEC."
   (let* ((req (betterdatadog--analytics-request spec))
          (parsed (betterdatadog--post-json (car req) (cdr req))))
-    (betterdatadog--analytics-series-from-response parsed)))
+    (betterdatadog--analytics-series-from-response parsed spec)))
 
 (defun betterdatadog--fetch-series-for-spec (spec)
   "Synchronously fetch series for resolved SPEC (no cache)."
@@ -656,7 +740,9 @@ missing afterward are fetched synchronously on demand at render time."
                     (append url-request-extra-headers
                             '(("Content-Type" . "application/json")))
                     url-request-data (json-encode (cdr req))
-                    parser #'betterdatadog--analytics-series-from-response)))
+                    parser (lambda (parsed)
+                             (betterdatadog--analytics-series-from-response
+                              parsed spec)))))
           (url-retrieve
            url
            (lambda (status cache-key parse-fn)
@@ -681,37 +767,80 @@ missing afterward are fetched synchronously on demand at render time."
         (while (and (> (aref remaining 0) 0) (< (float-time) deadline))
           (accept-process-output nil 0.05))))))
 
-(defun betterdatadog--downsample (values width)
-  "Reduce VALUES to at most WIDTH buckets, averaging the numbers in each.
-Buckets with no numeric values become nil (rendered as a gap)."
-  (let ((len (length values)))
-    (if (or (<= len width) (<= width 0))
-        values
-      (let ((vec (vconcat values))
-            (out '())
-            (i 0))
-        (while (< i width)
-          (let* ((start (floor (/ (* i len) (float width))))
-                 (end (max (1+ start)
-                           (floor (/ (* (1+ i) len) (float width)))))
-                 (sum 0) (cnt 0) (j start))
-            (while (and (< j end) (< j len))
-              (let ((v (aref vec j)))
-                (when (numberp v) (setq sum (+ sum v) cnt (1+ cnt))))
-              (setq j (1+ j)))
-            (push (if (> cnt 0) (/ sum (float cnt)) nil) out))
-          (setq i (1+ i)))
-        (nreverse out)))))
+(defun betterdatadog--numbers (values)
+  "Return the numeric entries of VALUES, in order."
+  (delq nil (mapcar (lambda (v) (and (numberp v) v)) values)))
 
-(defun betterdatadog--spark-chart (values height)
+(defun betterdatadog--window-bounds ()
+  "Return (FROM . TO), the graph window in epoch milliseconds.
+The window ends when the current data was fetched, so a re-render from
+the cache keeps points and time axis in step."
+  (let ((to (* 1000.0 (or betterdatadog--window-end (float-time)))))
+    (cons (- to (* 1000.0 betterdatadog-graph-window-seconds)) to)))
+
+(defun betterdatadog--chart-width (group &optional max-width)
+  "Return the number of columns used to chart the series in GROUP.
+This is MAX-WIDTH (default `betterdatadog-sparkline-width'), narrowed to
+one column per
+sample when the data is coarser than that, so widely spaced points draw
+as a solid chart rather than isolated bars.  The sample spacing comes
+from each series' :interval, else from the smallest gap between points."
+  (let ((width (max 1 (or max-width betterdatadog-sparkline-width)))
+        (step nil))
+    (dolist (s group)
+      (let ((iv (plist-get s :interval)))
+        (when (and (numberp iv) (> iv 0))
+          (setq step (if step (min step (* 1000.0 iv)) (* 1000.0 iv))))))
+    (unless step
+      (dolist (s group)
+        (let ((prev nil))
+          (dolist (p (plist-get s :points))
+            (let ((ts (car p)))
+              (when (and prev (> ts prev)
+                         (or (null step) (< (- ts prev) step)))
+                (setq step (- ts prev)))
+              (setq prev ts))))))
+    (if step
+        (max 1 (min width
+                    (round (/ (* 1000.0 betterdatadog-graph-window-seconds)
+                              step))))
+      width)))
+
+(defun betterdatadog--bucket-points (points from to width)
+  "Place POINTS on a WIDTH-column timeline spanning FROM..TO (epoch ms).
+POINTS is a list of (TIMESTAMP VALUE).  Return a list of WIDTH entries:
+the largest value falling in each column (so short spikes survive
+downsampling), or nil for a column with no data (rendered as a gap)."
+  (let ((cols (make-vector width nil))
+        (span (max 1.0 (- to from))))
+    (dolist (p points)
+      (let ((v (nth 1 p)))
+        (when (numberp v)
+          (let* ((i (floor (* width (/ (- (car p) from) span))))
+                 (i (max 0 (min (1- width) i)))
+                 (old (aref cols i)))
+            (aset cols i (if old (max old v) v))))))
+    (append cols nil)))
+
+(defun betterdatadog--scale (nums)
+  "Return (LO . HI), the y-axis range for charting NUMS.
+Honours `betterdatadog-graph-include-zero'."
+  (let ((lo (if nums (apply #'min nums) 0))
+        (hi (if nums (apply #'max nums) 0)))
+    (if betterdatadog-graph-include-zero
+        (cons (min 0 lo) (max 0 hi))
+      (cons lo hi))))
+
+(defun betterdatadog--spark-chart (values height &optional lo hi)
   "Return a list of HEIGHT strings (top row first) charting VALUES.
 Each row contributes 8 levels of vertical resolution; non-numeric
 entries render as gaps and numeric points always fill at least one
-level so real data is never mistaken for a gap."
+level so real data is never mistaken for a gap.  The y-axis runs from LO
+to HI, defaulting to the range of VALUES."
   (let* ((height (max 1 height))
-         (nums (delq nil (mapcar (lambda (v) (and (numberp v) v)) values)))
-         (lo (if nums (apply #'min nums) 0))
-         (hi (if nums (apply #'max nums) 0))
+         (nums (betterdatadog--numbers values))
+         (lo (or lo (if nums (apply #'min nums) 0)))
+         (hi (or hi (if nums (apply #'max nums) 0)))
          (range (- hi lo))
          (units (* 8 height))
          (levels betterdatadog--spark-levels)
@@ -719,9 +848,13 @@ level so real data is never mistaken for a gap."
          (cols (mapcar
                 (lambda (v)
                   (when (numberp v)
-                    (max 1 (if (= range 0)
-                               (/ units 2)
-                             (round (* units (/ (- v lo) (float range))))))))
+                    (max 1 (cond
+                            ((> range 0)
+                             (round (* units (/ (- v lo) (float range)))))
+                            ;; A flat line: on the baseline at zero,
+                            ;; mid-height otherwise.
+                            ((zerop v) 1)
+                            (t (/ units 2))))))
                 values))
          (rows '()))
     (dotimes (i height)
@@ -740,65 +873,599 @@ level so real data is never mistaken for a gap."
     (nreverse rows)))
 
 (defun betterdatadog--fmt (n)
-  "Format number N compactly for a summary line."
+  "Format number N exactly, for a scalar value."
   (cond ((not (numberp n)) "—")
         ((= n (truncate n)) (format "%d" (truncate n)))
         (t (format "%.4g" n))))
 
-(defun betterdatadog--insert-chart-rows (vals indent)
-  "Draw a multi-row chart for the series VALS at INDENT spaces.
-VALS is a chronological list of numbers (nil entries are gaps).  The top
-and bottom rows are labelled with the max and min, and a `last' value is
-printed below."
-  (let* ((pad (make-string (+ indent 2) ?\s))
-         (nums (delq nil (mapcar (lambda (v) (and (numberp v) v)) vals))))
-    (if (null nums)
-        (insert (propertize (concat pad "· (no data)\n")
-                            'face 'betterdatadog-meta-face))
-      (let* ((rows (betterdatadog--spark-chart
-                    (betterdatadog--downsample vals betterdatadog-sparkline-width)
-                    betterdatadog-graph-height))
-             (n (length rows))
-             (hi (apply #'max nums))
-             (lo (apply #'min nums))
-             (i 0))
-        (dolist (row rows)
-          (insert pad)
-          (insert (propertize row 'face 'betterdatadog-graph-face))
-          (cond
-           ((= i 0)
-            (insert (propertize (format "  ┈ %s" (betterdatadog--fmt hi))
-                                'face 'betterdatadog-meta-face)))
-           ((= i (1- n))
-            (insert (propertize (format "  ┈ %s" (betterdatadog--fmt lo))
-                                'face 'betterdatadog-meta-face))))
-          (insert "\n")
-          (setq i (1+ i)))
-        (insert pad)
-        (insert (propertize (format "last %s"
-                                    (betterdatadog--fmt (car (last nums))))
-                            'face 'betterdatadog-meta-face))
-        (insert "\n")))))
+(defun betterdatadog--fmt-sig (x)
+  "Format X to about three significant digits, without an exponent."
+  (let ((a (abs x)))
+    (cond
+     ((zerop a) "0")
+     ((< a 0.001) (format "%.2g" x))
+     (t (let ((s (format (cond ((>= a 100) "%.0f")
+                               ((>= a 10) "%.1f")
+                               ((>= a 1) "%.2f")
+                               (t "%.3f"))
+                         x)))
+          (if (string-match-p "\\." s)
+              (replace-regexp-in-string "\\.?0+\\'" "" s)
+            s))))))
 
-(defun betterdatadog--insert-graph (query indent)
+(defun betterdatadog--fmt-scaled (n steps)
+  "Format N using the largest fitting entry of STEPS.
+STEPS is a list of (THRESHOLD . SUFFIX) in descending order; N is divided
+by the first THRESHOLD it reaches (else the last) and given that SUFFIX."
+  (let ((step (or (cl-find-if (lambda (s) (>= (abs n) (car s))) steps)
+                  (car (last steps)))))
+    (concat (betterdatadog--fmt-sig (/ n (float (car step)))) (cdr step))))
+
+(defun betterdatadog--fmt-compact (n)
+  "Format number N compactly, e.g. 1234567 -> \"1.23M\"."
+  (if (not (numberp n))
+      "—"
+    (betterdatadog--fmt-scaled
+     n '((1e12 . "T") (1e9 . "B") (1e6 . "M") (1e3 . "K") (1 . "")))))
+
+(defun betterdatadog--fmt-value (n unit)
+  "Format number N compactly in UNIT.
+UNIT is a Datadog unit pair (UNIT PER-UNIT) as returned with a metric
+series, or nil.  Times, byte sizes and CPU cores are rescaled to a
+readable magnitude (e.g. 0.0042 second -> \"4.2ms\"); other units are
+appended."
+  (let* ((u (car-safe unit))
+         (per (car-safe (cdr-safe unit)))
+         (family (alist-get 'family u))
+         (factor (let ((f (alist-get 'scale_factor u))) (if (numberp f) f 1)))
+         (short (or (alist-get 'short_name u) (alist-get 'name u)))
+         (per-short (and per (or (alist-get 'short_name per)
+                                 (alist-get 'name per)))))
+    (concat
+     (cond
+      ((not (numberp n)) "—")
+      ((zerop n) "0")
+      ((equal family "time")
+       (let ((secs (* n factor)))
+         (if (>= (abs secs) 1)
+             (betterdatadog--fmt-scaled
+              secs '((86400 . "d") (3600 . "h") (60 . "min") (1 . "s")))
+           (betterdatadog--fmt-scaled
+            (* secs 1e9) '((1e6 . "ms") (1e3 . "µs") (1 . "ns"))))))
+      ((equal family "bytes")
+       (betterdatadog--fmt-scaled
+        (* n factor)
+        `((,(expt 1024.0 4) . "TiB") (,(expt 1024.0 3) . "GiB")
+          (,(expt 1024.0 2) . "MiB") (1024.0 . "KiB") (1 . "B"))))
+      ((equal family "cpu")
+       (concat (betterdatadog--fmt-compact (* n factor)) " cores"))
+      ((member short '("%" "percent")) (concat (betterdatadog--fmt-compact n) "%"))
+      (short (concat (betterdatadog--fmt-compact n) " " short))
+      (t (betterdatadog--fmt-compact n)))
+     (if (and (numberp n) (not (zerop n)) per-short)
+         (concat "/" per-short)
+       ""))))
+
+(defun betterdatadog--time-axis (width from to)
+  "Return (AXIS . LABELS), two strings drawing a WIDTH-column time axis.
+FROM and TO are the epoch-millisecond bounds of the chart.  Ticks mark
+the start, middle and end, dropping to fewer when WIDTH is too narrow to
+label them all."
+  (let* ((secs (/ (- to from) 1000.0))
+         (fmt (cond ((< secs 600) "%H:%M:%S")
+                    ((<= secs 86400) "%H:%M")
+                    (t "%b %d %H:%M")))
+         (label (lambda (ms) (format-time-string fmt (/ ms 1000.0))))
+         (left (funcall label from))
+         (mid (funcall label (/ (+ from to) 2.0)))
+         (right (funcall label to))
+         (n (length right))
+         (last (1- width))
+         (middle (/ last 2))
+         ;; Each tick is (COLUMN LABEL LABEL-START-COLUMN).
+         (ticks (cond
+                 ((>= width (+ (* 3 n) 4))
+                  (list (list 0 left 0)
+                        (list middle mid (- middle (/ (length mid) 2)))
+                        (list last right (- width n))))
+                 ((>= width (+ (* 2 n) 2))
+                  (list (list 0 left 0) (list last right (- width n))))
+                 (t (list (list last right (max 0 (- width n)))))))
+         (axis (make-string width ?─))
+         (labels (make-string (max width n) ?\s)))
+    (dolist (tick ticks)
+      (aset axis (nth 0 tick) ?┬)
+      (let ((text (nth 1 tick))
+            (start (nth 2 tick)))
+        (dotimes (i (length text))
+          (aset labels (+ start i) (aref text i)))))
+    (cons axis (string-trim-right labels))))
+
+(defun betterdatadog--join-label (&rest parts)
+  "Join the non-empty strings in PARTS with a separator, or return nil."
+  (let ((parts (cl-remove-if-not
+                (lambda (p) (and (stringp p) (not (string-empty-p p))))
+                parts)))
+    (and parts (string-join parts " · "))))
+
+(defun betterdatadog--insert-note (text indent &optional label)
+  "Insert the one-line note TEXT at INDENT, prefixed by LABEL when non-nil."
+  (insert (make-string (+ indent 2) ?\s))
+  (when label
+    (insert (propertize label 'face 'betterdatadog-series-face) "  "))
+  (insert (propertize (concat "· (" text ")") 'face 'betterdatadog-meta-face)
+          "\n"))
+
+(defun betterdatadog--insert-chart (series width lo hi gutter indent)
+  "Draw SERIES as a labelled chart at INDENT spaces.
+SERIES is a plist with :points (a chronological list of (TIMESTAMP
+VALUE)), :nums (its numeric values), and optionally :label and :unit.
+The chart is WIDTH columns wide on a y-axis running LO..HI, whose labels
+are right-aligned in GUTTER columns; below it come a time axis and a
+min/avg/max/last summary."
+  (let* ((pad (make-string (+ indent 2) ?\s))
+         (unit (plist-get series :unit))
+         (nums (plist-get series :nums))
+         (label (plist-get series :label))
+         (bounds (betterdatadog--window-bounds))
+         (rows (betterdatadog--spark-chart
+                (betterdatadog--bucket-points
+                 (plist-get series :points) (car bounds) (cdr bounds) width)
+                betterdatadog-graph-height lo hi))
+         (n (length rows))
+         (axis (betterdatadog--time-axis width (car bounds) (cdr bounds)))
+         (meta (lambda (s) (propertize s 'face 'betterdatadog-meta-face)))
+         (i 0))
+    (when label
+      (insert pad (propertize label 'face 'betterdatadog-series-face) "\n"))
+    (dolist (row rows)
+      (let ((tick (cond ((= i 0) (betterdatadog--fmt-value hi unit))
+                        ((= i (1- n)) (betterdatadog--fmt-value lo unit)))))
+        (insert pad
+                (funcall meta (concat (make-string
+                                       (max 0 (- gutter (length tick))) ?\s)
+                                      tick
+                                      (if tick " ┤" " │")))
+                (propertize (string-trim-right row)
+                            'face 'betterdatadog-graph-face)
+                "\n"))
+      (setq i (1+ i)))
+    (insert pad (funcall meta (concat (make-string (1+ gutter) ?\s) "└"
+                                      (car axis)))
+            "\n"
+            pad (funcall meta (concat (make-string (+ gutter 2) ?\s)
+                                      (cdr axis)))
+            "\n"
+            pad (funcall meta (betterdatadog--stats nums unit))
+            "\n")))
+
+(defun betterdatadog--stats (nums unit)
+  "Return the min/avg/max/last summary of NUMS, formatted in UNIT."
+  (format "min %s · avg %s · max %s · last %s"
+          (betterdatadog--fmt-value (apply #'min nums) unit)
+          (betterdatadog--fmt-value
+           (/ (apply #'+ nums) (float (length nums))) unit)
+          (betterdatadog--fmt-value (apply #'max nums) unit)
+          (betterdatadog--fmt-value (car (last nums)) unit)))
+
+;;;;; SVG charts
+;;
+;; On a graphical display each group of series is drawn as one SVG image:
+;; the series overlaid as lines (or stacked as areas/bars, following the
+;; widget's `display_type'), with gridlines and axis ticks, and a text
+;; legend underneath carrying each series' label and summary.
+
+(defvar betterdatadog--display-type nil
+  "The `display_type' of the widget request being rendered, or nil.
+Bound by `betterdatadog--insert-query'; one of \"line\", \"area\" or
+\"bars\" for timeseries widgets.")
+
+(defvar betterdatadog--collector nil
+  "When non-nil, a cons (SERIES . DROPPED) gathering series to chart.
+`betterdatadog--insert-query' binds it while rendering one widget
+request as SVG, so that everything the request plots (all its formulas)
+lands on a single chart, as in Datadog, instead of one chart each.
+SERIES is the list of series plists so far; DROPPED counts those left
+out by `betterdatadog-max-series'.")
+
+(defun betterdatadog--svg-p ()
+  "Return non-nil when graphs should be drawn as SVG images.
+See `betterdatadog-graph-style'."
+  (and (not (eq betterdatadog-graph-style 'unicode))
+       (or (eq betterdatadog-graph-style 'svg) (display-graphic-p))
+       (image-type-available-p 'svg)))
+
+(defun betterdatadog--hex-color (color fallback)
+  "Return COLOR (any Emacs color name) as \"#rrggbb\", else FALLBACK.
+SVG renderers do not know X11 names such as \"grey50\"."
+  (let ((rgb (and (stringp color) (ignore-errors (color-values color)))))
+    (if rgb
+        (apply #'format "#%02x%02x%02x" (mapcar (lambda (c) (ash c -8)) rgb))
+      fallback)))
+
+(defun betterdatadog--nice-step (range count)
+  "Return a round step (1, 2 or 5 times a power of ten) for an axis.
+The step divides RANGE into about COUNT intervals."
+  (let* ((raw (/ (float range) (max 1 count)))
+         (mag (expt 10.0 (floor (log raw 10))))
+         (f (/ raw mag)))
+    (* mag (cond ((<= f 1) 1) ((<= f 2) 2) ((<= f 5) 5) (t 10)))))
+
+(defun betterdatadog--unit-divisor (hi unit)
+  "Return the amount of UNIT that one displayed unit of HI stands for.
+`betterdatadog--fmt-value' rescales times and byte sizes (a value of
+3e11 nanoseconds reads \"5min\"), so ticks must be round in the
+displayed magnitude rather than the raw one.  For other units this is 1."
+  (let* ((u (car-safe unit))
+         (family (alist-get 'family u))
+         (factor (let ((f (alist-get 'scale_factor u)))
+                   (if (and (numberp f) (> f 0)) f 1)))
+         (x (abs (* hi factor)))
+         (steps (cond
+                 ((equal family "time") '(86400 3600 60 1 1e-3 1e-6 1e-9))
+                 ((equal family "bytes")
+                  (list (expt 1024.0 4) (expt 1024.0 3) (expt 1024.0 2)
+                        1024.0 1)))))
+    (if steps
+        (/ (or (cl-find-if (lambda (s) (>= x s)) steps) (car (last steps)))
+           (float factor))
+      1.0)))
+
+(defun betterdatadog--y-ticks (lo hi &optional unit)
+  "Return tick values for a y-axis running LO..HI that read round in UNIT."
+  (let* ((d (betterdatadog--unit-divisor hi unit))
+         (step (betterdatadog--nice-step (/ (- hi lo) d) 4))
+         (v (* step (ceiling (/ lo d step))))
+         (ticks '()))
+    (while (<= v (+ (/ hi d) (* step 1e-6)))
+      (push (* v d) ticks)
+      (setq v (+ v step)))
+    (nreverse ticks)))
+
+(defconst betterdatadog--time-steps
+  '(1 5 10 15 30 60 120 300 600 900 1800 3600 7200 10800 21600 43200
+    86400 172800 604800)
+  "Candidate spacings, in seconds, between time-axis ticks.")
+
+(defun betterdatadog--time-ticks (from to max-count)
+  "Return (FORMAT . TIMES) for a time axis spanning FROM..TO (epoch ms).
+TIMES are at most MAX-COUNT epoch-second values on round local clock
+times; FORMAT is the `format-time-string' spec that labels them."
+  (let* ((from (/ from 1000.0))
+         (to (/ to 1000.0))
+         (span (- to from))
+         (step (or (cl-find-if (lambda (s) (<= (/ span s) max-count))
+                               betterdatadog--time-steps)
+                   (car (last betterdatadog--time-steps))))
+         ;; Align to the local clock, not UTC.
+         (offset (or (car (current-time-zone (seconds-to-time from))) 0))
+         (tick (- (* step (ceiling (/ (+ from offset) step))) offset))
+         (times '()))
+    (while (<= tick to)
+      (push tick times)
+      (setq tick (+ tick step)))
+    (cons (cond ((< step 60) "%H:%M:%S")
+                ((>= step 86400) "%b %d")
+                ((> span 86400) "%a %H:%M")
+                (t "%H:%M"))
+          (nreverse times))))
+
+(defun betterdatadog--line-segments (cols max-gap)
+  "Split COLS into runs of points to join with a line.
+COLS is a list of bucket values (nil for an empty bucket).  Return a
+list of segments, each a list of (INDEX . VALUE); a new segment starts
+wherever more than MAX-GAP consecutive buckets are empty, so short
+holes are bridged but real outages show as breaks."
+  (let ((segments '()) (current '()) (prev nil) (i 0))
+    (dolist (v cols)
+      (when (numberp v)
+        (when (and prev (> (- i prev) (1+ max-gap)) current)
+          (push (nreverse current) segments)
+          (setq current '()))
+        (push (cons i v) current)
+        (setq prev i))
+      (setq i (1+ i)))
+    (when current (push (nreverse current) segments))
+    (nreverse segments)))
+
+(defun betterdatadog--svg-chart (group)
+  "Return an SVG image charting the series plists in GROUP together.
+Each series needs :points, :nums and :color.  Series are overlaid as
+lines, or stacked as areas or bars when `betterdatadog--display-type'
+says so, on a shared y-axis labelled in the first series' unit."
+  (let* ((type (if (member betterdatadog--display-type '("bars" "area"))
+                   betterdatadog--display-type
+                 "line"))
+         (stacked (not (equal type "line")))
+         (unit (plist-get (car group) :unit))
+         (fs 11)
+         (family (let ((f (face-attribute 'default :family nil t)))
+                   (if (and (stringp f) (display-graphic-p)) f "monospace")))
+         (fg (betterdatadog--hex-color
+              (face-foreground 'betterdatadog-meta-face nil t) "#888888"))
+         (bounds (betterdatadog--window-bounds))
+         (from (car bounds))
+         (to (cdr bounds))
+         (plot-w (* (max 8 betterdatadog-sparkline-width)
+                    (if (display-graphic-p) (frame-char-width) 8)))
+         (plot-h (max 40 betterdatadog-svg-height))
+         ;; Bars need room to be seen; lines can use every other pixel.
+         (n (betterdatadog--chart-width
+             group (max 2 (/ plot-w (if (equal type "bars") 4 2)))))
+         (cols (mapcar (lambda (s)
+                         (betterdatadog--bucket-points
+                          (plist-get s :points) from to n))
+                       group))
+         ;; For stacked charts, the running total under each series.
+         (bases (let ((acc (make-list n 0)) (out '()))
+                  (dolist (c cols)
+                    (push acc out)
+                    (setq acc (cl-mapcar (lambda (a v) (+ a (or v 0))) acc c)))
+                  (push acc out)
+                  (nreverse out)))
+         (scale (if stacked
+                    (let ((betterdatadog-graph-include-zero t))
+                      (betterdatadog--scale (apply #'append bases)))
+                  (betterdatadog--scale
+                   (apply #'append
+                          (mapcar (lambda (s) (plist-get s :nums)) group)))))
+         (lo (car scale))
+         (hi (if (> (cdr scale) lo) (cdr scale) (+ lo 1)))
+         (y-ticks (betterdatadog--y-ticks lo hi unit))
+         (y-labels (mapcar (lambda (v) (betterdatadog--fmt-value v unit))
+                           y-ticks))
+         (x-ticks (betterdatadog--time-ticks from to (max 2 (/ plot-w 90))))
+         ;; Room for half a time label to overhang either end of the axis.
+         (overhang (+ 4 (ceiling (* 0.31 fs (length (format-time-string
+                                                     (car x-ticks) 0))))))
+         (left (max overhang
+                    (+ 10 (ceiling (* 0.62 fs (apply #'max 1
+                                                     (mapcar #'length
+                                                             y-labels)))))))
+         (top 8)
+         (width (+ left plot-w overhang))
+         (height (+ top plot-h fs 12))
+         (bottom (+ top plot-h))
+         (x-of (lambda (i) (+ left (* plot-w (/ (+ i 0.5) n)))))
+         (y-of (lambda (v) (+ top (* plot-h (- 1 (/ (- v lo) (float (- hi lo))))))))
+         (text (lambda (svg string x y anchor)
+                 (svg-text svg string :x x :y y :font-size fs
+                           :font-family family :fill fg :text-anchor anchor)))
+         (svg (svg-create width height)))
+    ;; Horizontal gridlines with their y labels.
+    (cl-mapc
+     (lambda (v label)
+       (let ((y (funcall y-of v)))
+         (svg-line svg left y (+ left plot-w) y
+                   :stroke-color fg :stroke-width 1 :stroke-opacity 0.25)
+         (funcall text svg label (- left 6) (+ y (* 0.35 fs)) "end")))
+     y-ticks y-labels)
+    ;; The data.
+    (cl-loop
+     for s in group
+     for c in cols
+     for base in bases
+     for color = (plist-get s :color)
+     do
+     (pcase type
+       ("bars"
+        (let ((bar-w (max 1.0 (- (/ plot-w (float n)) 1)))
+              (i 0))
+          (cl-mapc
+           (lambda (v b)
+             (when (and (numberp v) (/= v 0))
+               (let ((y0 (funcall y-of b))
+                     (y1 (funcall y-of (+ b v))))
+                 (svg-rectangle svg (- (funcall x-of i) (/ bar-w 2))
+                                (min y0 y1) bar-w (max 1 (abs (- y0 y1)))
+                                :fill-color color)))
+             (setq i (1+ i)))
+           c base)))
+       ("area"
+        (let ((upper '()) (lower '()) (i 0))
+          (cl-mapc
+           (lambda (v b)
+             (let ((x (funcall x-of i)))
+               (push (cons x (funcall y-of (+ b (or v 0)))) upper)
+               (push (cons x (funcall y-of b)) lower))
+             (setq i (1+ i)))
+           c base)
+          (svg-polygon svg (append (reverse upper) lower)
+                       :fill-color color :fill-opacity 0.45)
+          (svg-polyline svg (reverse upper) :fill "none"
+                        :stroke-color color :stroke-width 1.2)))
+       (_
+        (dolist (segment (betterdatadog--line-segments c (max 1 (/ n 8))))
+          (let ((points (mapcar (lambda (p)
+                                  (cons (funcall x-of (car p))
+                                        (funcall y-of (cdr p))))
+                                segment)))
+            (if (cdr points)
+                (progn
+                  ;; A lone series gets a soft fill down to the baseline.
+                  (unless (cdr group)
+                    (svg-polygon
+                     svg
+                     (append points
+                             (list (cons (car (car (last points))) bottom)
+                                   (cons (car (car points)) bottom)))
+                     :fill-color color :fill-opacity 0.12))
+                  (svg-polyline svg points :fill "none"
+                                :stroke-color color :stroke-width 1.5
+                                :stroke-linejoin "round"))
+              ;; An isolated sample would otherwise be invisible.
+              (svg-circle svg (car (car points)) (cdr (car points)) 2
+                          :fill-color color)))))))
+    ;; Time axis.
+    (svg-line svg left bottom (+ left plot-w) bottom
+              :stroke-color fg :stroke-width 1 :stroke-opacity 0.6)
+    (dolist (tick (cdr x-ticks))
+      (let ((x (+ left (* plot-w (/ (- (* 1000.0 tick) from) (- to from))))))
+        (svg-line svg x bottom x (+ bottom 4)
+                  :stroke-color fg :stroke-width 1 :stroke-opacity 0.6)
+        (funcall text svg (format-time-string (car x-ticks) tick)
+                 x (+ bottom fs 6) "middle")))
+    (svg-image svg :ascent 'center)))
+
+(defun betterdatadog--insert-svg-chart (group indent)
+  "Insert one SVG chart of the series in GROUP at INDENT, with a legend.
+GROUP holds series plists with :nums and :color; series without data
+are named in the legend only."
+  (let* ((pad (make-string (+ indent 2) ?\s))
+         (drawn (cl-remove-if-not (lambda (s) (plist-get s :nums)) group))
+         (label-width (apply #'max 0
+                             (mapcar (lambda (s)
+                                       (length (plist-get s :label)))
+                                     group))))
+    (when drawn
+      (insert pad)
+      (insert-image (betterdatadog--svg-chart drawn) "[graph]")
+      (insert "\n"))
+    (dolist (s group)
+      (let ((label (or (plist-get s :label) ""))
+            (nums (plist-get s :nums)))
+        (insert pad
+                (propertize "━━" 'face (list :foreground (plist-get s :color)))
+                " ")
+        (when (> label-width 0)
+          (insert (propertize label 'face 'betterdatadog-series-face)
+                  (make-string (+ 2 (- label-width (length label))) ?\s)))
+        (insert (propertize (if nums
+                                (betterdatadog--stats nums (plist-get s :unit))
+                              "· (no data)")
+                            'face 'betterdatadog-meta-face)
+                "\n")))))
+
+(defun betterdatadog--insert-svg-group (group indent)
+  "Draw the series plists in GROUP as SVG at INDENT spaces.
+They share one chart, or get one each when
+`betterdatadog-graph-shared-scale' is nil."
+  (let* ((colors (or betterdatadog-series-colors '("#3399ff")))
+         (i -1)
+         (group (mapcar (lambda (s)
+                          (setq i (1+ i))
+                          (append (list :color (nth (% i (length colors)) colors))
+                                  s))
+                        group)))
+    (if betterdatadog-graph-shared-scale
+        (betterdatadog--insert-svg-chart group indent)
+      (dolist (s group)
+        (betterdatadog--insert-svg-chart (list s) indent)))))
+
+(defun betterdatadog--insert-text-group (group indent)
+  "Draw the series plists in GROUP as Unicode charts at INDENT spaces."
+  (let* ((shared (and betterdatadog-graph-shared-scale
+                      (betterdatadog--scale
+                       (apply #'append
+                              (mapcar (lambda (s) (plist-get s :nums))
+                                      group)))))
+         ;; Each series paired with its (LO . HI) y-axis range.
+         (scaled (mapcar
+                  (lambda (s)
+                    (cons s (or shared (betterdatadog--scale
+                                        (plist-get s :nums)))))
+                  group))
+         (width (betterdatadog--chart-width group))
+         ;; One gutter for the whole group keeps the plots aligned.
+         (gutter (apply #'max 0
+                        (mapcar
+                         (lambda (c)
+                           (let ((unit (plist-get (car c) :unit)))
+                             (max (length (betterdatadog--fmt-value
+                                           (cadr c) unit))
+                                  (length (betterdatadog--fmt-value
+                                           (cddr c) unit)))))
+                         scaled))))
+    (dolist (c scaled)
+      (if (plist-get (car c) :nums)
+          (betterdatadog--insert-chart
+           (car c) width (cadr c) (cddr c) gutter indent)
+        (betterdatadog--insert-note
+         "no data" indent (plist-get (car c) :label))))))
+
+(defun betterdatadog--insert-series-group (group indent)
+  "Chart every series in GROUP at INDENT spaces.
+GROUP is a list of series plists (see `betterdatadog--insert-chart')
+that belong together, e.g. the series of one `by {tag}' query.  They are
+drawn as one SVG image or as Unicode charts, per
+`betterdatadog-graph-style', and share a y-axis when
+`betterdatadog-graph-shared-scale' is set.  At most
+`betterdatadog-max-series' are drawn, keeping those with the highest
+averages."
+  (let* ((group (mapcar
+                 (lambda (s)
+                   (append
+                    (list :nums (betterdatadog--numbers
+                                 (mapcar (lambda (p) (nth 1 p))
+                                         (plist-get s :points))))
+                    s))
+                 group))
+         (total (length group))
+         (limit (and (integerp betterdatadog-max-series)
+                     (> betterdatadog-max-series 0)
+                     betterdatadog-max-series))
+         (avg (lambda (s)
+                (let ((nums (plist-get s :nums)))
+                  (if nums (/ (apply #'+ nums) (float (length nums))) -1e+INF)))))
+    (when (and limit (> total limit))
+      (setq group (cl-subseq (cl-sort (copy-sequence group) #'> :key avg)
+                             0 limit)))
+    (let ((dropped (if limit (max 0 (- total limit)) 0)))
+      (cond
+       (betterdatadog--collector
+        (setcar betterdatadog--collector
+                (append (car betterdatadog--collector) group))
+        (setcdr betterdatadog--collector
+                (+ (cdr betterdatadog--collector) dropped)))
+       ((betterdatadog--svg-p)
+        (let ((betterdatadog--collector (cons group dropped)))
+          (betterdatadog--flush-collector indent)))
+       (t
+        (betterdatadog--insert-text-group group indent)
+        (betterdatadog--insert-dropped-note dropped indent))))))
+
+(defun betterdatadog--insert-dropped-note (dropped indent)
+  "Note at INDENT that DROPPED series were left out, when there are any."
+  (when (> dropped 0)
+    (betterdatadog--insert-note
+     (format "%d more series not shown" dropped) indent)))
+
+(defun betterdatadog--flush-collector (indent)
+  "Draw the series gathered in `betterdatadog--collector' at INDENT."
+  (let ((group (car betterdatadog--collector)))
+    (if (cl-some (lambda (s) (plist-get s :nums)) group)
+        (betterdatadog--insert-svg-group group indent)
+      (dolist (s group)
+        (betterdatadog--insert-note "no data" indent (plist-get s :label))))
+    (betterdatadog--insert-dropped-note (cdr betterdatadog--collector) indent)))
+
+(defun betterdatadog--series-tags (series)
+  "Return the group tags of API SERIES as one string, \"\" when ungrouped."
+  (string-join (sort (copy-sequence (alist-get 'tag_set series)) #'string<)
+               ", "))
+
+(defun betterdatadog--insert-graph (query indent &optional label)
   "Resolve QUERY, fetch its data, and chart each returned series at INDENT.
-Errors and empty results degrade to a short note rather than aborting
-the surrounding render."
-  (let ((pad (make-string (+ indent 2) ?\s)))
-    (condition-case err
-        (let ((series (betterdatadog--query-series query)))
-          (if (null series)
-              (insert (propertize (concat pad "· (no data)\n")
-                                  'face 'betterdatadog-meta-face))
-            (dolist (s series)
-              (betterdatadog--insert-chart-rows
-               (mapcar (lambda (p) (nth 1 p)) (alist-get 'pointlist s))
-               indent))))
-      (error
-       (insert (propertize
-                (format "%s· (graph unavailable: %s)\n"
-                        pad (error-message-string err))
-                'face 'betterdatadog-meta-face))))))
+Each chart is titled with LABEL (when non-nil) and the series' group
+tags.  Errors and empty results degrade to a short note rather than
+aborting the surrounding render."
+  (condition-case err
+      (let ((series (betterdatadog--query-series query)))
+        (if (null series)
+            (betterdatadog--insert-note "no data" indent label)
+          (betterdatadog--insert-series-group
+           (mapcar (lambda (s)
+                     (list :label (betterdatadog--join-label
+                                   label (betterdatadog--series-tags s))
+                           :points (alist-get 'pointlist s)
+                           :unit (alist-get 'unit s)
+                           :interval (alist-get 'interval s)))
+                   series)
+           indent)))
+    (error
+     (betterdatadog--insert-note
+      (format "graph unavailable: %s" (error-message-string err))
+      indent label))))
 
 (defun betterdatadog--last-number (values)
   "Return the last numeric value in VALUES, or nil."
@@ -831,40 +1498,69 @@ the surrounding render."
 ;; widget is meant to display, so we fetch each named query, align the
 ;; series on a common timeline, and evaluate the formula point by point.
 
-(defun betterdatadog--fetch-pointmap (query)
-  "Fetch resolved QUERY and return a hash of TIMESTAMP -> value (first series).
-Timestamps are truncated to integer milliseconds so series from separate
-requests align exactly.  Returns nil when there is no data."
-  (let ((series (betterdatadog--query-series query)))
-    (when series
-      (let ((h (make-hash-table :test 'eql)))
-        (dolist (p (alist-get 'pointlist (car series)))
-          (let ((v (nth 1 p)))
-            (puthash (truncate (nth 0 p)) (and (numberp v) v) h)))
-        h))))
-
-(defun betterdatadog--build-env (qmap)
-  "Fetch every query in QMAP (alist NAME->query-string) and align them.
-Return (TIMELINE . ENV): TIMELINE is the sorted union of all timestamps,
-and ENV is an alist NAME->list-of-values aligned to TIMELINE.  Returns
-nil when nothing has data."
-  (let ((maps '())
-        (ts-set (make-hash-table :test 'eql)))
+(defun betterdatadog--build-envs (qmap)
+  "Fetch every query in QMAP (alist NAME->query spec) and align them.
+Return one plist per series group, so a formula over `by {tag}' queries
+is evaluated once per tag combination.  Each plist has :label (the group
+tags, nil when ungrouped), :timeline (the sorted union of the group's
+timestamps), :env (alist NAME->list-of-values aligned to :timeline) and
+:interval (the sample spacing in seconds, when known).  An ungrouped
+query contributes its single series to every group.  Timestamps are
+truncated to integer milliseconds so series from separate requests
+align exactly.  Returns nil when nothing has data."
+  (let ((per-query '())
+        (keys '())
+        (interval nil))
     (dolist (pair qmap)
-      (let ((h (betterdatadog--fetch-pointmap (cdr pair))))
-        (push (cons (car pair) h) maps)
-        (when h (maphash (lambda (k _v) (puthash k t ts-set)) h))))
-    (let ((timeline '()))
-      (maphash (lambda (k _v) (push k timeline)) ts-set)
-      (setq timeline (sort timeline #'<))
-      (when timeline
-        (cons timeline
-              (mapcar
-               (lambda (m)
-                 (cons (car m)
-                       (mapcar (lambda (ts) (and (cdr m) (gethash ts (cdr m))))
-                               timeline)))
-               maps))))))
+      (let ((groups '()))
+        (dolist (s (betterdatadog--query-series (cdr pair)))
+          (let ((key (betterdatadog--series-tags s))
+                (iv (alist-get 'interval s))
+                (h (make-hash-table :test 'eql)))
+            (dolist (p (alist-get 'pointlist s))
+              (let ((v (nth 1 p)))
+                (puthash (truncate (nth 0 p)) (and (numberp v) v) h)))
+            (when (and (numberp iv) (> iv 0))
+              (setq interval (if interval (min interval iv) iv)))
+            (push (cons key h) groups)
+            (unless (or (string-empty-p key) (member key keys))
+              (push key keys))))
+        (push (cons (car pair) (nreverse groups)) per-query)))
+    (setq per-query (nreverse per-query))
+    (delq
+     nil
+     (mapcar
+      (lambda (key)
+        (let* ((maps
+                (mapcar
+                 (lambda (q)
+                   (let ((groups (cdr q)))
+                     (cons (car q)
+                           (or (cdr (assoc key groups))
+                               ;; An ungrouped query applies to every group.
+                               (and (= (length groups) 1)
+                                    (string-empty-p (caar groups))
+                                    (cdar groups))))))
+                 per-query))
+               (ts-set (make-hash-table :test 'eql))
+               (timeline '()))
+          (dolist (m maps)
+            (when (cdr m)
+              (maphash (lambda (k _v) (puthash k t ts-set)) (cdr m))))
+          (maphash (lambda (k _v) (push k timeline)) ts-set)
+          (setq timeline (sort timeline #'<))
+          (when timeline
+            (list :label (unless (string-empty-p key) key)
+                  :timeline timeline
+                  :interval interval
+                  :env (mapcar
+                        (lambda (m)
+                          (cons (car m)
+                                (mapcar (lambda (ts)
+                                          (and (cdr m) (gethash ts (cdr m))))
+                                        timeline)))
+                        maps)))))
+      (or (nreverse keys) '(""))))))
 
 (defun betterdatadog--num-op (op a b)
   "Apply arithmetic OP to numbers A and B, propagating nil and /0 as nil."
@@ -994,32 +1690,43 @@ formula cannot be parsed or references an unknown query."
             (if (< pos len) nil v))
         (error nil)))))
 
-(defun betterdatadog--insert-formula-graph (formula qmap indent)
+(defun betterdatadog--insert-formula-graph (formula qmap indent &optional label)
   "Evaluate FORMULA over the named queries in QMAP and chart it at INDENT.
-QMAP is an alist of NAME->query-string.  Failures degrade to a note."
-  (let ((pad (make-string (+ indent 2) ?\s)))
-    (condition-case err
-        (let ((built (betterdatadog--build-env qmap)))
-          (if (null built)
-              (insert (propertize (concat pad "· (no data)\n")
-                                  'face 'betterdatadog-meta-face))
-            (let ((result (betterdatadog--eval-formula formula (cdr built))))
-              (cond
-               ((null result)
-                (insert (propertize (concat pad "· (could not evaluate formula)\n")
-                                    'face 'betterdatadog-meta-face)))
-               ((numberp result)
-                (insert pad)
-                (insert (propertize (format "= %s" (betterdatadog--fmt result))
-                                    'face 'betterdatadog-meta-face))
-                (insert "\n"))
-               (t
-                (betterdatadog--insert-chart-rows result indent))))))
-      (error
-       (insert (propertize
-                (format "%s· (graph unavailable: %s)\n"
-                        pad (error-message-string err))
-                'face 'betterdatadog-meta-face))))))
+QMAP is an alist of NAME->query spec.  Grouped queries yield one chart
+per group, each titled with LABEL (when non-nil) and the group's tags.
+Failures degrade to a note."
+  (condition-case err
+      (let ((envs (betterdatadog--build-envs qmap))
+            (group '())
+            (constant nil)
+            (failed nil))
+        (dolist (e envs)
+          (let ((result (betterdatadog--eval-formula formula (plist-get e :env)))
+                (name (betterdatadog--join-label label (plist-get e :label))))
+            (cond
+             ((null result) (setq failed t))
+             ;; A formula of constants only: there is nothing to chart.
+             ((numberp result) (setq constant result))
+             (t
+              (push (list :label name
+                          :points (cl-mapcar #'list
+                                             (plist-get e :timeline) result)
+                          :interval (plist-get e :interval))
+                    group)))))
+        (cond
+         (group (betterdatadog--insert-series-group (nreverse group) indent))
+         (constant
+          (insert (make-string (+ indent 2) ?\s)
+                  (propertize (concat "= " (betterdatadog--fmt constant))
+                              'face 'betterdatadog-meta-face)
+                  "\n"))
+         (failed (betterdatadog--insert-note
+                  "could not evaluate formula" indent label))
+         ((null envs) (betterdatadog--insert-note "no data" indent label))))
+    (error
+     (betterdatadog--insert-note
+      (format "graph unavailable: %s" (error-message-string err))
+      indent label))))
 
 (defun betterdatadog--build-scalar-env (qmap window-seconds)
   "Fetch every query in QMAP as a scalar over WINDOW-SECONDS."
@@ -1077,7 +1784,8 @@ QMAP is an alist of NAME->query-string.  Failures degrade to a note."
   "Insert the query/queries found in REQUEST alist at INDENT spaces.
 When SCALAR-WINDOW is non-nil, render values as numbers over that window
 instead of charts."
-  (let ((pad (make-string indent ?\s)))
+  (let ((pad (make-string indent ?\s))
+        (betterdatadog--display-type (alist-get 'display_type request)))
     (cond
      ;; Classic single-query form: { "q": "avg:system.cpu..." }
      ((alist-get 'q request)
@@ -1100,49 +1808,81 @@ instead of charts."
                             (let ((name (alist-get 'name query))
                                   (spec (betterdatadog--query-spec query)))
                               (when (and name spec) (cons name spec))))
-                          queries))))
+                          queries)))
+             ;; With several queries or formulas, name each one so the
+             ;; charts below can be told apart.
+             (named (> (length qmap) 1)))
         ;; List each underlying query for transparency.
         (when betterdatadog-show-queries
           (dolist (query queries)
-            (let ((spec (betterdatadog--query-spec query)))
+            (let ((spec (betterdatadog--query-spec query))
+                  (name (alist-get 'name query)))
               (when spec
                 (insert pad)
+                (when (and named name)
+                  (insert (propertize (concat name " = ")
+                                      'face 'betterdatadog-meta-face)))
                 (insert (propertize (betterdatadog--spec-query spec)
                                     'face 'betterdatadog-query-face))
                 (insert "\n")))))
         (when betterdatadog-show-graphs
-          (if (and formulas qmap)
-              ;; Chart the widget's actual formula(s), not the raw queries.
-              (dolist (f formulas)
-                (let* ((fs (alist-get 'formula f))
-                       ;; A formula that is just a query name plots that query
-                       ;; directly (so multi-series `by {tag}` queries keep
-                       ;; all their series); anything else is evaluated.
-                       (bare (and fs (assoc (string-trim fs) qmap))))
-                  (cond
-                   ((null fs) nil)
-                   (bare
+          (let ((betterdatadog--collector
+                 (and (not scalar-window) (betterdatadog--svg-p)
+                      (cons nil 0))))
+            (if (and formulas qmap)
+                ;; Chart the widget's actual formula(s), not the raw queries.
+                (dolist (f formulas)
+                  (let* ((fs (alist-get 'formula f))
+                         (alias (alist-get 'alias f))
+                         (alias (and (stringp alias)
+                                     (not (string-empty-p alias))
+                                     alias))
+                         ;; A formula that is just a query name plots that query
+                         ;; directly (so multi-series `by {tag}` queries keep
+                         ;; all their series and units); anything else is
+                         ;; evaluated.
+                         (bare (and fs (assoc (string-trim fs) qmap)))
+                         ;; Title the chart with the widget's alias, spelling
+                         ;; out a computed formula when queries are shown.
+                         (label (cond
+                                 ((null fs) nil)
+                                 ((null alias)
+                                  (and (or (not bare) named (cdr formulas))
+                                       (string-trim fs)))
+                                 ((and (not bare) betterdatadog-show-queries)
+                                  (format "%s = %s" alias (string-trim fs)))
+                                 (t alias))))
+                    (cond
+                     ((null fs) nil)
+                     (scalar-window
+                      (when (and (not bare) betterdatadog-show-queries)
+                        (insert (propertize (concat pad "  ↳ " fs "\n")
+                                            'face 'betterdatadog-meta-face)))
+                      (if bare
+                          (betterdatadog--insert-scalar
+                           (cdr bare) indent scalar-window)
+                        (betterdatadog--insert-formula-scalar
+                         fs qmap indent scalar-window)))
+                     (bare
+                      (betterdatadog--insert-graph (cdr bare) indent label))
+                     (t
+                      (betterdatadog--insert-formula-graph
+                       fs qmap indent label)))))
+              ;; No formulas: chart each query directly.
+              (dolist (query queries)
+                (let ((spec (betterdatadog--query-spec query)))
+                  (when spec
                     (if scalar-window
-                        (betterdatadog--insert-scalar (cdr bare) indent scalar-window)
-                      (betterdatadog--insert-graph (cdr bare) indent)))
-                   (t
-                    (when betterdatadog-show-queries
-                      (insert (propertize (concat pad "  ↳ " fs "\n")
-                                          'face 'betterdatadog-meta-face)))
-                    (if scalar-window
-                        (betterdatadog--insert-formula-scalar fs qmap indent scalar-window)
-                      (betterdatadog--insert-formula-graph fs qmap indent))))))
-            ;; No formulas: chart each query directly.
-            (dolist (query queries)
-              (let ((spec (betterdatadog--query-spec query)))
-                (when spec
-                  (if scalar-window
-                      (betterdatadog--insert-scalar spec indent scalar-window)
-                    (betterdatadog--insert-graph spec indent)))))))))
+                        (betterdatadog--insert-scalar spec indent scalar-window)
+                      (betterdatadog--insert-graph
+                       spec indent
+                       (and named (alist-get 'name query))))))))
+            (when betterdatadog--collector
+              (betterdatadog--flush-collector indent))))))
      ;; Log/event style: { "log_query": { "search": { "query": "..." } } }
      (betterdatadog-show-queries
       (dolist (key '(log_query rum_query apm_query process_query network_query
-                     event_query security_query))
+                               event_query security_query))
         (let ((sub (alist-get key request)))
           (when sub
             (let ((q (or (alist-get 'query (alist-get 'search sub))
@@ -1205,7 +1945,8 @@ own explicit duration in the title."
     ;; Reuse any cache built earlier in this buffer so display-only toggles
     ;; (queries/graphs) re-render without re-fetching; `g'/`w' reset it.
     (unless betterdatadog--series-cache
-      (setq betterdatadog--series-cache (make-hash-table :test 'equal)))
+      (setq betterdatadog--series-cache (make-hash-table :test 'equal)
+            betterdatadog--window-end (float-time)))
     (when betterdatadog-show-graphs
       (betterdatadog--prefetch
        (betterdatadog--collect-queries (alist-get 'widgets dashboard))))

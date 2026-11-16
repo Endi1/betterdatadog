@@ -8,11 +8,16 @@ A better Datadog client for Emacs.
   it in an Emacs buffer: title, description, and every widget (recursing into
   group widgets) with the metric queries that power it.
 - **Live graphs** — betterdatadog fetches the last hour of data (via the
-  Datadog query API) and draws a multi-row Unicode chart (scale-labelled, with
-  a `last` value below it). When a widget defines a **formula** (e.g. an
+  Datadog query API) and charts it: as an inline **SVG image** in graphical
+  Emacs (lines, stacked areas or bars following the widget's display type,
+  all of a widget request's series overlaid in colour), or as multi-row
+  **Unicode block charts** in a terminal. Either way you get a labelled
+  y-axis, a time axis, and a `min · avg · max · last` summary per series,
+  each named by the widget's alias and, for `by {tag}` queries, its tags. When a widget defines a **formula** (e.g. an
   average rendered as `sum / count`), the formula is evaluated point-by-point
-  over its named queries and that result is charted — so you see the real
-  value the widget represents, not the raw component series. Template variables
+  over its named queries (once per tag group) and that result is charted — so
+  you see the real value the widget represents, not the raw component series.
+  Template variables
   (e.g. `$model_name`) are resolved from the dashboard's defaults before
   querying. Toggle with `betterdatadog-toggle-graphs`; set the size with
   `betterdatadog-graph-height` and `betterdatadog-sparkline-width`.
@@ -161,6 +166,57 @@ Graphs are controlled by `betterdatadog-show-graphs` (default `t`),
 `betterdatadog-graph-height` (default `6`), and
 `betterdatadog-sparkline-width` (default `72`).
 
+`betterdatadog-graph-style` (default `auto`) picks the renderer: `auto`
+draws SVG images when Emacs is running graphically with SVG support and
+Unicode charts otherwise; `svg` and `unicode` force one or the other.
+
+**SVG graphs.** Everything one widget request plots — all its formulas and
+all the series of a `by {tag}` query — shares a single chart, as in Datadog.
+The request's `display_type` decides the shape: lines are overlaid, while
+`area` and `bars` are stacked. Short holes in a line are bridged and longer
+outages show as breaks. A legend under the image gives each series its colour
+(from `betterdatadog-series-colors`), label and summary as ordinary,
+searchable text. The plot is `betterdatadog-sparkline-width` text columns
+wide and `betterdatadog-svg-height` pixels tall (default `140`). Axis colours
+come from `betterdatadog-meta-face` when the chart is drawn, so after
+switching theme run `betterdatadog-toggle-graphs` twice (or refresh) to
+redraw. With `betterdatadog-graph-shared-scale` set to `nil`, each series gets
+its own chart.
+
+**Unicode graphs** draw one chart per series:
+
+```
+  provider:gemma
+  15.7/s ┤          ▄▁ ▁▅  ▂▇▅▁▃▂▁▂▆▂▃▁ ▁ █▄▂▂ ▂▃
+         │       ▆▇▇██▄██▇▅████████████▇█▃████▇██
+       0 ┤▂▂█▅████▆██████████████████████████████
+         └┬─────────────────┬──────────────────┬
+          23:16           23:46            00:16
+  min 0.05/s · avg 10.9/s · max 15.7/s · last 7.9/s
+```
+
+Common to both:
+
+- **Y-axis** — labelled top and bottom, with compact values (`1.23K`,
+  `4.5M`) in the metric's unit where Datadog reports one (`145ms`,
+  `30.7GiB`, `1.5K req/s`). It includes zero by default, like Datadog's own
+  graphs; set `betterdatadog-graph-include-zero` to `nil` to span only the
+  data's min..max instead.
+- **Time axis** — points are placed by timestamp across the whole window, so
+  a series that only reported for part of it appears in the right place, and
+  every chart on the board lines up. Columns with no data are left blank.
+- **Downsampling** — when there are more points than columns, each column
+  shows the largest value that falls in it, so short spikes stay visible.
+- **Grouped queries** — the series of a `by {tag}` query are each labelled
+  with their tags and share a y-axis so they can be compared; set
+  `betterdatadog-graph-shared-scale` to `nil` to scale each series on its
+  own. At most `betterdatadog-max-series` (default `10`) are drawn per query
+  — the ones with the highest averages — and the rest are counted in a note;
+  set it to `nil` for no limit.
+- **Colours** — customize `betterdatadog-series-face` (series labels),
+  `betterdatadog-graph-face` (Unicode bars) and `betterdatadog-series-colors`
+  (SVG series).
+
 Graph data is fetched **in parallel** before rendering: each distinct
 query is requested once (duplicates across widgets are de-duplicated) and
 all requests run concurrently, so a board's load time is roughly the
@@ -185,13 +241,10 @@ Key health metrics for the web tier.
 id: abc-def-ghi    layout: ordered    widgets: 4
 
 ▸ Time to first token (avg)  [timeseries]
-  sum:ttft_seconds.sum{*}.as_count()
-  sum:ttft_seconds.count{*}.as_count()
-    ↳ query1 / query2
-       ▂▃ ▄  ▃           ┈ 0.51
-     ▃█████▆█▅▃
-  ▂▅████████████▇▅▃▂      ┈ 0.08
-  last 0.45
+  query1 = sum:ttft_seconds.sum{*}.as_count()
+  query2 = sum:ttft_seconds.count{*}.as_count()
+    [SVG line chart]
+    ━━ ttft = query1 / query2  min 0.08 · avg 0.31 · max 0.51 · last 0.45
 
 ▸ Errors  [group]
   ▸ 5xx count  [query_value]

@@ -53,12 +53,22 @@ flows through them in order:
    `betterdatadog-fetch-timeout` elapses; misses fall back to synchronous fetch
    at render time via `--query-series`. This parallelism is why a board loads in
    roughly the time of its slowest single query.
+   Charts are drawn here too: `--insert-series-group` takes a list of series
+   plists (`:label`, `:points` as `(TIMESTAMP-MS VALUE)`, `:unit`,
+   `:interval`) that belong together and hands them to one of two renderers,
+   chosen by `--svg-p` (`betterdatadog-graph-style`): `--insert-text-group` /
+   `--insert-chart` (Unicode: y-axis gutter, bars, time axis, summary line,
+   one chart per series) or `--insert-svg-group` / `--svg-chart` (one SVG
+   image with the series overlaid or stacked, plus a text legend). Both
+   bucket points by timestamp onto the window (`--bucket-points`), not by
+   index.
 4. **Formula evaluation** — widgets can define formulas over named queries
    (e.g. `sum / count`). The formula is evaluated point-by-point across the
    component series so the chart shows the value the widget actually represents,
-   not the raw components.
+   not the raw components. `--build-envs` yields one environment per tag group,
+   so grouped queries produce one chart per group.
 5. **Rendering** — draws the buffer: title, widgets, optional query strings,
-   and multi-row sparklines.
+   and the charts.
 6. **Dashboard id history** — `--load-history` / `--save-history` /
    `--remember-dashboard` persist successfully-fetched ids (with titles) to
    `betterdatadog-history-file`, loaded lazily once per session.
@@ -80,6 +90,18 @@ flows through them in order:
   force a refetch. Toggling graphs/queries deliberately *keeps* the cache and
   the cached dashboard alist (`betterdatadog--current-dashboard`) so re-renders
   are instant.
+- **Series shape**: every fetched series is an alist with a `pointlist` plus
+  optional `tag_set`, `unit`, and `interval`, as the v1 metric query API
+  returns it. `--analytics-series-from-response` builds the same shape for
+  logs/spans (whose two APIs nest buckets differently — see
+  `--analytics-buckets`), so charting never cares where a series came from.
+- **`betterdatadog--window-end`** is set whenever the series cache is created
+  and anchors every chart's time axis, so cached re-renders stay consistent.
+- **`betterdatadog--collector`**: in SVG mode `--insert-query` binds this
+  while rendering one widget request, so `--insert-series-group` accumulates
+  series instead of drawing, and the request's formulas end up on one chart
+  (`--flush-collector`). `betterdatadog--display-type` is bound the same way
+  to carry the request's `display_type` down to `--svg-chart`.
 - **Buffer-local state**: `betterdatadog--current-dashboard-id`,
   `--current-dashboard`, and the display toggles (`-show-graphs`,
   `-show-queries`, `-graph-window-seconds`) are set buffer-locally by commands
